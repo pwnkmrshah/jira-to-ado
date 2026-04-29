@@ -8,28 +8,52 @@ Copies work items from Jira to Azure DevOps, including fields, attachments, comm
 
 ## Running the Script
 
+All three arguments can be passed as flags or omitted to be prompted interactively.
+
 ```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py copy \
+python jira_ado_copy/scripts/worker_jira_to_ado_copy.py
+```
+
+Or pass any combination of arguments directly:
+
+```bash
+python jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
   --jira-instance <instance_name> \
   --jira-filter <filter_id> \
   --ado-project <project_name>
 ```
 
+Any argument not provided on the command line will be prompted for interactively.
+
 ### Arguments
 
-| Argument | Required | Description |
-|---|---|---|
-| `--jira-instance` | Yes | Jira instance name (the subdomain from `https://<instance>.atlassian.net`) |
-| `--jira-filter` | Yes | Jira filter ID that returns the issues to copy |
-| `--ado-project` | Yes | Target Azure DevOps project name |
+| Argument | Description |
+|---|---|
+| `--jira-instance` | Jira instance name (the subdomain from `https://<instance>.atlassian.net`) |
+| `--jira-filter` | Jira filter ID that returns the issues to copy |
+| `--ado-project` | Target Azure DevOps project name |
 
-### Example
+### Examples
+
+**Fully interactive** (prompts for all three):
 
 ```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py copy \
+python jira_ado_copy/scripts/worker_jira_to_ado_copy.py
+```
+
+**Fully scripted** (no prompts):
+
+```bash
+python jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
   --jira-instance healthfinch \
   --jira-filter 12345 \
   --ado-project "My Project"
+```
+
+**Partially scripted** (prompts for missing args):
+
+```bash
+python jira_ado_copy/scripts/worker_jira_to_ado_copy.py --jira-instance healthfinch
 ```
 
 ### What Gets Copied
