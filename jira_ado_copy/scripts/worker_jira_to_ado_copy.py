@@ -35,44 +35,32 @@ def load_config(filename: str):  #-> dict[str, str]:
 
 def main():
     parser = argparse.ArgumentParser(description='Jira to ADO Copy')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    parser.add_argument('--jira-instance', help='Jira source instance name (from URL)')
+    parser.add_argument('--jira-filter', help='Jira source filter ID')
+    parser.add_argument('--ado-project', help='ADO target project name')
 
-    # Configure command
-    config_parser = subparsers.add_parser('copy', help='Copy Jira tickets to ADO')
-    config_parser.add_argument('--jira-instance', required=True, help='Jira source instance name (from URL)')
-    config_parser.add_argument('--jira-filter', required=True, help='Jira source filter ID')
-    config_parser.add_argument('--ado-project', required=True, help='ADO target project name')
-    
-    #list_work_items_parser.add_argument('--query', default="Select [System.Id] From WorkItems")
-    
     args = parser.parse_args()
 
+    if not args.jira_instance:
+        args.jira_instance = input("Enter Jira instance name: ").strip()
+    if not args.jira_filter:
+        args.jira_filter = input("Enter Jira filter ID: ").strip()
+    if not args.ado_project:
+        args.ado_project = input("Enter ADO project name: ").strip()
+
+    jira_instance = args.jira_instance
+    jira_filter = args.jira_filter
+    ado_project = args.ado_project
+
     try:
-        # Parse script execute command parameters
-        if args.command == 'copy':
+        print(f'Copying Jira Work Items from {jira_instance} to {ado_project}')
+        logging.info(f'Copying Jira Work Items from {jira_instance} to {ado_project}')
 
-            if not args.jira_instance:
-                raise ValueError("Jira Instance name is required. Use --jira-instance.")
-            if not args.jira_filter:
-                raise ValueError("Project name is required. Use --jira-filter.")
-            if not args.ado_project:
-                raise ValueError("Project name is required. Use --ado-project.")
+        ado_config = load_ado_config()
+        ado_client = AzureDevOpsClient(ado_config, ado_project)
 
-            jira_instance = args.jira_instance
-            jira_filter = args.jira_filter
-            ado_project = args.ado_project
-
-            print(f'Copying Jira Work Items from {jira_instance} to {ado_project}')
-            logging.info(f'Copying Jira Work Items from {jira_instance} to {ado_project}')
-
-            ado_config = load_ado_config()
-            ado_client = AzureDevOpsClient(ado_config, ado_project)
-
-            jira_config = load_jira_config(jira_instance)
-            jira_client = JiraClient(jira_config)
-      
-        else:
-            parser.print_help()
+        jira_config = load_jira_config(jira_instance)
+        jira_client = JiraClient(jira_config)
 
         # Get all tickets from Jira using the provided filter ID
         jira_df = jira_client.get_filter_items(jira_filter)
