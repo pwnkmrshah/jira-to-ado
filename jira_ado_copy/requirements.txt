@@ -1,0 +1,6 @@
+requests
+dataclasses
+pandas
+datetime
+logging
+pathlib

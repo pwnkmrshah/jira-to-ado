@@ -1,0 +1,5 @@
+{
+    "server": "https://healthfinch.atlassian.net",
+    "email": "your.name@healthcatalyst.com",
+    "access_token": "your PAT from Jira"
+}

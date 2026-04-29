@@ -1,0 +1,37 @@
+trigger: none   # No CI trigger
+
+resources:
+  webhooks:
+    - webhook: ADOWebhookTrigger
+      connection: ADOWebhookConnection
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  workItemId: ${{ parameters.ADOWebhookTrigger.resource.id }}
+
+steps:
+- task: PowerShell@2
+  displayName: Triggering Item Information
+  inputs:
+    targetType: 'inline'
+    ### JSON payload data is available in the form of ${{ parameters.<WebhookAlias>.<JSONPath>}}
+    # parameters.ADOWebhookTrigger.message.text
+    # $jsonParams = '${{ convertToJson(parameters.ADOWebhookTrigger) }}'
+    #  Write-Host "Payload = $jsonParams"
+    script: |
+      Write-Host "Work Item ID = $(workItemId)"
+
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.13'
+
+- script: |
+    pip install -r jira_ado_copy/requirements.txt
+    python scripts/worker_jira_to_ado_copy.py
+  displayName: Test Work Item Creation Trigger
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    WORK_ITEM: $(workItemId)
+

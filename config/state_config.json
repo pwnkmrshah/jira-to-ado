@@ -1,0 +1,10 @@
+{
+    "Jira State": "ADO State",
+    "Default": "New",
+    "Draft Eng": "New",
+    "Draft CS": "New",
+    "In Progress": "Active",
+    "Acceptance Ready": "QA Review",
+    "Done": "Completed",
+    "Shelved": "Removed"
+}

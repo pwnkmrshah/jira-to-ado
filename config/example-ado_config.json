@@ -1,0 +1,6 @@
+{
+  "organization_url": "https://dev.azure.com/healthcatalyst",
+  "username": "your.name@healthcatalyst.com",
+  "access_token": "your ADO PAT",
+  "project": "Your Project Name"
+}
