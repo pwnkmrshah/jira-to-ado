@@ -41,12 +41,16 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.jira_instance:
-        args.jira_instance = input("Enter Jira instance name: ").strip()
-    if not args.jira_filter:
-        args.jira_filter = input("Enter Jira filter ID: ").strip()
-    if not args.ado_project:
-        args.ado_project = input("Enter ADO project name: ").strip()
+    try:
+        while not args.jira_instance:
+            args.jira_instance = input("Enter Jira instance name: ").strip()
+        while not args.jira_filter:
+            args.jira_filter = input("Enter Jira filter ID: ").strip()
+        while not args.ado_project:
+            args.ado_project = input("Enter ADO project name: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(1)
 
     jira_instance = args.jira_instance
     jira_filter = args.jira_filter
