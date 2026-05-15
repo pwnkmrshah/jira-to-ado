@@ -6,5 +6,8 @@
     "In Progress": "Active",
     "Acceptance Ready": "QA Review",
     "Done": "Completed",
-    "Shelved": "Removed"
+    "Deployed": "Completed",
+    "Shelved": "Removed",
+    "Won't Do": "Removed",
+    "WONT DO": "Removed"
 }

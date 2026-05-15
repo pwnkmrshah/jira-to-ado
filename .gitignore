@@ -5,7 +5,10 @@ __pycache__/
 
 # C extensions
 *.so
-
+config/ado_config.json
+config/jira_config.json
+config/migration_mapping.json
+config/failed_issues.json
 # Distribution / packaging
 .Python
 build/

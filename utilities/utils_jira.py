@@ -71,6 +71,7 @@ class JiraClient:
         
         except RequestException as e:   
             logger.error(f"Failed to connect to JIRA: {str(e)}")
+            return None
 
         try:
             return response.json()

@@ -1,11 +1,11 @@
 {
     "Jira Type": "ADO Type",
     "Default": "Issue",
-    "Task": "Task",
+    "Task": "Issue",
     "Bug": "Bug",
     "Story": "User Story",
     "Improvement": "User Story",
-    "Epic": "Epic",
+    "Epic": "User Story",
     "Feature Request": "Request",
     "Support Request": "Issue",
     "Triage": "Issue"
