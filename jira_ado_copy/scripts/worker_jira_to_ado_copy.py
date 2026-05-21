@@ -512,13 +512,6 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
 
     jira_fields = jira_ticket['fields']
 
-    # Current Start Date ← Jira created date
-    if ts := jira_fields.get('created'):
-        try:
-            ado_client.update_field(ado_id, '/fields/Microsoft.VSTS.Scheduling.StartDate', _to_ado_date(ts))
-        except Exception as e:
-            logging.warning(f"[dates] Could not set StartDate for {jira_key}: {e}")
-
     # Actual Completion Date ← Jira resolutiondate (overrides the date ADO auto-sets on state change)
     if ts := jira_fields.get('resolutiondate'):
         try:

@@ -8,10 +8,11 @@ Checks per ticket:
   4b  Description present
   4c  Priority mapped
   4d  Reporter in description
-  4e  Assignee in AssignedTo field or description
+  4e  Assignee: if Jira has assignee → must appear in ADO AssignedTo and/or description;
+               if Jira has NO assignee → ADO AssignedTo must be null
   5   Comments count (ADO >= Jira)
   6   Labels / tags
-  7a  Start Date matches Jira created date
+  7a  Start Date field removed — ADO value must be empty
   7b  Actual Completion Date matches Jira resolutiondate (not migration date)
   7c  Actual Start Date matches Jira created date
   7d  Target Date matches Jira due date (if set)
@@ -23,8 +24,17 @@ Checks per ticket:
 Generates migration_verification_report.html (convert to PDF via weasyprint).
 
 Usage:
+  # By explicit key list:
   python3 verify_migration.py --jira-instance healthfinch \
     --jira-keys "ICE-1,ICE-2" --ado-project "Embedded Refills Engineering"
+
+  # By board prefix (reads migration_mapping.json):
+  python3 verify_migration.py --jira-instance healthfinch \
+    --project-key HIVE --ado-project "Embedded Refills Engineering"
+
+  # All migrated items:
+  python3 verify_migration.py --jira-instance healthfinch \
+    --project-key ALL --ado-project "Embedded Refills Engineering"
 """
 
 import sys
@@ -194,12 +204,17 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments):
         "Reporter line not found in ADO description")
 
     # 4e — Assignee
-    # Rule 1: No Jira assignee → skip (pass)
+    # Rule 1: No Jira assignee → ADO System.AssignedTo must also be null/empty
     # Rule 2: Jira has assignee → description MUST contain '<b>Assignee:</b> name'
     # Rule 3: If ADO System.AssignedTo is set → must match the Jira assignee email
     #         If ADO System.AssignedTo is empty → description-only fallback is acceptable
     if not jira_assignee:
-        checks["4e - Assignee"] = chk(True, "(unassigned)", "(unassigned)")
+        if ado_assigned:
+            checks["4e - Assignee"] = chk(
+                False, "(unassigned)", ado_assigned,
+                f"Jira has no assignee but ADO AssignedTo is '{ado_assigned}'")
+        else:
+            checks["4e - Assignee"] = chk(True, "(unassigned)", "(null) ✓")
     else:
         desc_has_assignee = ado_item and jira_assignee in ado_desc
         ado_has_field     = bool(ado_assigned)
@@ -239,12 +254,12 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments):
     else:
         checks["6 - Labels / Tags"] = chk(True, "(none)", "(none)")
 
-    # 7a — Start Date: Jira created → ADO Microsoft.VSTS.Scheduling.StartDate
+    # 7a — Start Date: field was removed from ADO; verify it is now empty
     exp_start = _jira_to_date(jira_created)
-    checks["7a - Start Date (Created)"] = chk(
-        not ado_item or not exp_start or ado_start_date == exp_start,
-        exp_start, ado_start_date or '(empty)',
-        f"Expected {exp_start}, got '{ado_start_date or '(empty)'}'")
+    checks["7a - Start Date (Removed)"] = chk(
+        not ado_item or not ado_start_date,
+        "(empty — field removed)", ado_start_date or '(empty)',
+        f"StartDate field should be empty after removal, but got '{ado_start_date}'")
 
     # 7b — Actual Completion Date: Jira resolutiondate → Custom.ActualCompletionDate
     MIGRATION_DATE = '2026-05-16'
@@ -502,12 +517,13 @@ def main():
     parser.add_argument('--jira-instance', required=True)
     parser.add_argument('--jira-filter',   help='Jira filter ID')
     parser.add_argument('--jira-keys',     help='Comma-separated Jira keys')
+    parser.add_argument('--project-key',   help='Board prefix (e.g. HIVE) or ALL — reads keys from migration_mapping.json')
     parser.add_argument('--ado-project',   required=True)
     parser.add_argument('--output',        default='migration_verification_report.html')
     args = parser.parse_args()
 
-    if not args.jira_filter and not args.jira_keys:
-        parser.error("Provide --jira-filter or --jira-keys")
+    if not args.jira_filter and not args.jira_keys and not args.project_key:
+        parser.error("Provide --jira-filter, --jira-keys, or --project-key")
 
     global TYPE_MAP, STATE_MAP
     TYPE_MAP  = load_config('type_config.json')
@@ -517,6 +533,19 @@ def main():
     jira_client = JiraClient(load_jira_config(args.jira_instance))
     mapping     = load_issue_mapping()
     logging.info(f"Loaded mapping with {len(mapping)} entries")
+
+    # --project-key: derive key list from migration_mapping.json
+    if args.project_key:
+        prefix = args.project_key.upper()
+        if prefix == 'ALL':
+            project_keys = sorted(mapping.keys())
+        else:
+            project_keys = sorted(k for k in mapping.keys() if k.startswith(prefix + '-'))
+        if not project_keys:
+            logging.error(f"No keys found for project '{args.project_key}' in migration_mapping.json")
+            sys.exit(1)
+        args.jira_keys = ','.join(project_keys)
+        logging.info(f"--project-key {args.project_key}: resolved {len(project_keys)} key(s)")
 
     jira_tickets = []
     if args.jira_keys:
@@ -567,9 +596,13 @@ def main():
         print(f"  {icon}  {key:<12} → ADO {ado_id or 'N/A'}")
 
     generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    args_summary = (f"jira-instance={args.jira_instance}  "
-                    f"{'filter='+args.jira_filter if args.jira_filter else 'keys='+args.jira_keys}  "
-                    f"ado-project={args.ado_project}")
+    if args.project_key:
+        scope_str = f"project-key={args.project_key}"
+    elif args.jira_filter:
+        scope_str = f"filter={args.jira_filter}"
+    else:
+        scope_str = f"keys={args.jira_keys}"
+    args_summary = f"jira-instance={args.jira_instance}  {scope_str}  ado-project={args.ado_project}"
 
     Path(args.output).write_text(build_report(all_results, generated_at, args_summary), encoding='utf-8')
     logging.info(f"\nReport written to: {Path(args.output).resolve()}")
