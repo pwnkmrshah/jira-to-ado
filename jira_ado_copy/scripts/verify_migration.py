@@ -147,6 +147,9 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments):
     jira_resolved = fields.get('resolutiondate', '')
     jira_duedate  = fields.get('duedate', '')  # already YYYY-MM-DD
 
+    # Exclude the CSV-header sentinel key ('Jira Type' / 'Jira State') from explicit-mapping checks
+    type_explicitly_mapped  = jira_type  in TYPE_MAP  and jira_type  != 'Jira Type'
+    state_explicitly_mapped = jira_state in STATE_MAP and jira_state != 'Jira State'
     expected_type  = TYPE_MAP.get(jira_type,  TYPE_MAP.get('Default', ''))
     expected_state = STATE_MAP.get(jira_state, STATE_MAP.get('Default', ''))
     expected_prio  = PRIO_MAP.get(jira_prio, '3-Medium')
@@ -176,10 +179,22 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments):
         f"{jira_type} → expected {expected_type}", ado_type,
         f"Expected '{expected_type}', got '{ado_type}'")
 
+    checks["2b - Jira Type Explicitly Mapped"] = chk(
+        type_explicitly_mapped,
+        jira_type,
+        f"Default → {expected_type}",
+        f"'{jira_type}' has no explicit entry in type_config.json — fell through to Default→'{expected_type}'")
+
     checks["3 - State / Workflow Mapping"] = chk(
         ado_item and ado_state.lower() == expected_state.lower(),
         f"{jira_state} → expected {expected_state}", ado_state,
         f"Expected '{expected_state}', got '{ado_state}'")
+
+    checks["3b - Jira State Explicitly Mapped"] = chk(
+        state_explicitly_mapped,
+        jira_state,
+        f"Default → {expected_state}",
+        f"'{jira_state}' has no explicit entry in state_config.json — fell through to Default→'{expected_state}'")
 
     checks["4a - Title Present"] = chk(
         ado_item and bool(ado_title) and jira_key in ado_title,

@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 import logging
 from pathlib import Path
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -250,7 +251,10 @@ class AzureDevOpsClient:
 
     def create_attachment(self, filename, attachment):
         # Create an attachment from the provided file information
-        url = f'{self.organization_url}/{self.project}/_apis/wit/attachments?fileName={filename}&api-version={self.api_version}'
+        # URL-encode the filename to handle special chars (e.g. Confluence media blob
+        # filenames that contain '#media-blob-url=...' fragments which break the URL)
+        safe_filename = quote(filename, safe='')
+        url = f'{self.organization_url}/{self.project}/_apis/wit/attachments?fileName={safe_filename}&api-version={self.api_version}'
 
         response = self.ado_api_call('POST', url, attachment)
         logging.debug(f"[create_attachment] Created attachment: {filename}")
