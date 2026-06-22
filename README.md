@@ -1,82 +1,242 @@
 # Jira to ADO Copy
 
-Copies work items from Jira to Azure DevOps, including fields, attachments, comments, pull request links, and linked issues.
+Complete migration suite for copying work items from Jira to Azure DevOps with validation, gap analysis, and verification.
 
-## How to obtain Access Tokens for each environment
-- Create Jira API token: https://id.atlassian.com/manage-profile/security/api-tokens
-- ADO API Token: https://dev.azure.com/healthcatalyst/_usersSettings/tokens
+**Three main tools:**
+1. **`worker_jira_to_ado_copy.py`** — Migrate cards by filter ID or specific keys
+2. **`migration_gap_analysis.py`** — Identify missing or misaligned cards after migration
+3. **`verify_migration.py`** — Verify field-by-field accuracy of migrated items
 
-## Running the Script
+## Setup
 
-All three arguments can be passed as flags or omitted to be prompted interactively.
+### Access Tokens
 
+- **Jira API token**: https://id.atlassian.com/manage-profile/security/api-tokens
+- **ADO Personal Access Token**: https://dev.azure.com/healthcatalyst/_usersSettings/tokens
+
+Store in `config/jira_config.json` and `config/ado_config.json` (see Configuration section).
+
+## Tool 1: Migration Worker (`worker_jira_to_ado_copy.py`)
+
+**Purpose:** Migrate work items from Jira to ADO using a Jira filter or specific card keys.
+
+### Quick Start
+
+**Migrate by Jira filter ID (all matching cards):**
 ```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py
+python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
+  --jira-instance healthfinch \
+  --jira-filter YOUR-FILTER-ID \
+  --ado-project "Embedded Refills Engineering"
 ```
 
-Or pass any combination of arguments directly:
-
+**Migrate specific Jira keys:**
 ```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
-  --jira-instance <instance_name> \
-  --jira-filter <filter_id> \
-  --ado-project <project_name>
+python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
+  --jira-instance healthfinch \
+  --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2" \
+  --ado-project "Embedded Refills Engineering"
 ```
 
-Any argument not provided on the command line will be prompted for interactively.
+**Interactive mode (prompts for missing arguments):**
+```bash
+python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py
+```
 
 ### Arguments
 
 | Argument | Description |
 |---|---|
-| `--jira-instance` | Jira instance name (the subdomain from `https://<instance>.atlassian.net`) |
-| `--jira-filter` | Jira filter ID that returns the issues to copy |
+| `--jira-instance` | Jira instance name (subdomain of `https://<instance>.atlassian.net`) |
+| `--jira-filter` | Jira filter ID that returns the issues to copy (e.g., `YOUR-FILTER-ID`) |
+| `--jira-keys` | Comma-separated list of specific Jira keys to migrate (e.g., `YOUR-CARD-ID,YOUR-CARD-ID-2`) |
 | `--ado-project` | Target Azure DevOps project name |
-
-### Examples
-
-**Fully interactive** (prompts for all three):
-
-```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py
-```
-
-**Fully scripted** (no prompts):
-
-```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
-  --jira-instance healthfinch \
-  --jira-filter 12345 \
-  --ado-project "My Project"
-```
-
-**Partially scripted** (prompts for missing args):
-
-```bash
-python jira_ado_copy/scripts/worker_jira_to_ado_copy.py --jira-instance healthfinch
-```
+| `--skip-attachments` | Skip attachment upload (useful for debugging large-file timeouts) |
 
 ### What Gets Copied
 
-For each issue returned by the Jira filter, the script copies:
-
-- Title (prefixed with Jira key and parent key if applicable)
-- Description (HTML)
-- Assignee and Reporter
-- State (mapped via `state_config.json`)
-- Work item type (mapped via `type_config.json`)
-- Custom fields (mapped via `custom_fields_config.json`)
-- Priority
-- Due date
-- Labels (as tags)
-- Attachments (with image references updated in descriptions)
-- Comments (with image references updated)
-- Pull request / branch hyperlinks
-- Linked issues (as hyperlinks back to Jira)
+For each card:
+- **Title** (prefixed with Jira key, e.g., `[OP-1480] Feature Name`)
+- **Description** (HTML, with embedded image references updated)
+- **Assignee & Reporter** (with graceful fallback to description if identity unknown)
+- **State** (mapped via `state_config.json`)
+- **Work item type** (mapped via `type_config.json`)
+- **Custom fields** (mapped via `custom_fields_config.json`)
+- **Priority, Due Date, Labels** (as tags)
+- **Attachments** (deduplicated by filename, with 3-attempt retry for transient errors)
+- **Comments** (with image references updated)
+- **Pull request links** (as hyperlinks)
+- **Linked issues** (as hyperlinks back to Jira)
+- **Jira key tag** (`jiraKey=OP-1480`) for traceability
 
 ### Logging
 
-Output is written to `worker_jira_to_ado_copy.log` in the working directory.
+Output is written to `worker_jira_to_ado_copy.log`.
+
+---
+
+## Tool 2: Migration Gap Analysis (`migration_gap_analysis.py`)
+
+**Purpose:** Identify cards in Jira that were not migrated to ADO, or migrated to the wrong area path.
+
+### Quick Start
+
+**Analyze a Jira filter against an ADO board:**
+```bash
+python3 jira_ado_copy/scripts/migration_gap_analysis.py \
+  --jira-instance healthfinch \
+  --jira-filter YOUR-FILTER-ID \
+  --ado-board "Operations" \
+  --ado-project "Embedded Refills Engineering" \
+  --csv data_migration_gap_report.csv 2>&1 | tail -50
+```
+
+### Arguments
+
+| Argument | Description |
+|---|---|
+| `--jira-instance` | Jira instance name |
+| `--jira-filter` | Jira filter ID to compare (source of truth, e.g., `YOUR-FILTER-ID`) |
+| `--ado-board` | ADO board name to check against (e.g., `YOUR-BOARD-NAME`) |
+| `--ado-project` | Target Azure DevOps project name |
+| `--csv` | Output file path for problem cards (CSV format) |
+
+### Output Classification
+
+Each card is classified into one of **four categories**:
+
+1. **`correct`** — Migrated and in the correct area path
+2. **`wrong_area`** — Migrated but in wrong area path (needs manual move)
+3. **`no_area_path`** — Migrated but missing area path assignment
+4. **`missed`** — Not in ADO at all (needs full re-migration)
+
+### CSV Report
+
+The CSV includes only **problem cards** (not all):
+
+```csv
+JiraKey,ExistsInADO,ADOId,AreaPath,MissingAreaPath,NeedsMigration,Notes
+YOUR-CARD-ID,Yes,12345,/YOUR-AREA-PATH,,No,"Description of issue"
+YOUR-CARD-ID-2,Yes,12346,,,Yes,"Migrated but area path not set"
+YOUR-CARD-ID-3,No,,,Yes,Yes,"Not migrated to ADO yet"
+```
+
+**Example insights:**
+- **Total** cards in Jira filter
+- **Correct** (in correct area path)
+- **Wrong area** (migrated but to different area path)
+- **Missed** (not migrated to ADO)
+
+---
+
+## Tool 3: Verification (`verify_migration.py`)
+
+**Purpose:** Verify field-by-field accuracy of migrated cards. Detect missing attachments, mismatched descriptions, etc.
+
+### Quick Start
+
+**Verify all cards in a Jira project:**
+```bash
+python3 jira_ado_copy/scripts/verify_migration.py \
+  --jira-instance healthfinch \
+  --project-key YOUR-PROJECT-KEY \
+  --ado-project "Embedded Refills Engineering"
+```
+
+**Verify specific cards:**
+```bash
+python3 jira_ado_copy/scripts/verify_migration.py \
+  --jira-instance healthfinch \
+  --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2,YOUR-CARD-ID-3" \
+  --ado-project "Embedded Refills Engineering"
+```
+
+**Verify with HTML report output:**
+```bash
+python3 jira_ado_copy/scripts/verify_migration.py \
+  --jira-instance healthfinch \
+  --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2,YOUR-CARD-ID-3" \
+  --ado-project "Embedded Refills Engineering" \
+  --html verification_report.html
+```
+
+### Arguments
+
+| Argument | Description |
+|---|---|
+| `--jira-instance` | Jira instance name |
+| `--project-key` | Jira project key (e.g., `YOUR-PROJECT-KEY`) — verifies ALL cards in project |
+| `--jira-keys` | Comma-separated Jira keys to verify (e.g., `YOUR-CARD-ID,YOUR-CARD-ID-2`) |
+| `--ado-project` | Target Azure DevOps project name |
+| `--html` | Output file path for HTML report |
+
+### Report Contents
+
+- **Pre-flight card count** — How many Jira cards, how many in ADO
+- **Per-field diff reporting** — Side-by-side comparison of Jira vs ADO for:
+  - Title, Description, State, Assignee, Due Date
+  - Attachment counts (e.g., "Jira: 23, ADO: 22 ⚠️ MISSING 1")
+  - Comment counts
+  - Link counts
+- **Attachment gap detection** — Lists which files failed to migrate
+- **HTML report** — Interactive report with pass/fail summary
+
+---
+
+## Complete Migration Workflow
+
+### Step 1: Identify gaps before migration
+
+```bash
+# Analyze which cards in Jira filter are not yet in ADO
+python3 jira_ado_copy/scripts/migration_gap_analysis.py \
+  --jira-instance healthfinch \
+  --jira-filter YOUR-FILTER-ID \
+  --ado-board "Operations" \
+  --ado-project "Embedded Refills Engineering" \
+  --csv gaps.csv
+```
+
+**Output:** `gaps.csv` shows missed cards + remediation command
+
+### Step 2: Run migration for missed cards
+
+```bash
+# From the CSV, extract jira keys that need migration
+# and run worker script with those keys
+python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
+  --jira-instance healthfinch \
+  --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2,YOUR-CARD-ID-3" \
+  --ado-project "Embedded Refills Engineering"
+```
+
+### Step 3: Verify success
+
+```bash
+# After migration completes, verify the cards
+python3 jira_ado_copy/scripts/verify_migration.py \
+  --jira-instance healthfinch \
+  --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2,YOUR-CARD-ID-3" \
+  --ado-project "Embedded Refills Engineering"
+```
+
+If attachment counts don't match, the worker script's 3-attempt retry already ran; check `worker_jira_to_ado_copy.log` for details on which files failed after 3 retries.
+
+### Step 4: Full validation (post-migration)
+
+```bash
+# Re-run gap analysis to confirm all cards migrated
+python3 jira_ado_copy/scripts/migration_gap_analysis.py \
+  --jira-instance healthfinch \
+  --jira-filter YOUR-FILTER-ID \
+  --ado-board "Operations" \
+  --ado-project "Embedded Refills Engineering" \
+  --csv final_report.csv
+```
+
+Expected: `final_report.csv` should be empty or contain only area-path misalignments (easily fixed with manual moves).
+
+---
 
 ## Configuration Files
 
@@ -149,146 +309,106 @@ Defines custom field mappings between Jira and ADO. Each entry specifies the ADO
 ]
 ```
 
-## Utility Reference: AzureDevOpsClient
 
-Located in `utilities/utils_ado.py`. Initialize with a config and project name:
 
-```python
-from utils_ado import AzureDevOpsClient, load_ado_config
+## Troubleshooting & Known Issues
 
-config = load_ado_config()
-client = AzureDevOpsClient(config, "My Project")
-```
+### Attachment Upload Failures
 
-### Methods
+**Symptom:** Worker script reports "2 succeeded, 0 failed" but verification finds missing attachments (e.g., Jira: 23, ADO: 22).
 
-#### `get_item_info(item_id)`
-Retrieves all fields for a work item. Returns a normalized `pandas` DataFrame.
+**Cause:** Large files (>500MB) or transient network issues trigger 503 timeout on ADO API. The worker script now retries 3 times with exponential backoff (2s, 4s, 8s).
 
-```python
-df = client.get_item_info(12345)
-```
+**Solution:**
+1. Check `worker_jira_to_ado_copy.log` for failed filenames after retry exhaustion
+2. Verify those specific cards: `python3 verify_migration.py --jira-keys "YOUR-CARD-ID"...`
+3. If still failing, use `--skip-attachments` flag and upload files manually:
+   ```bash
+   python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
+     --jira-instance healthfinch \
+     --jira-keys "YOUR-CARD-ID" \
+     --ado-project "Embedded Refills Engineering" \
+     --skip-attachments
+   ```
 
-#### `create_item(type, area_path=None, title=None, state=None, assigned_to=None, description=None)`
-Creates a new work item of the given type. Returns the API response with the new item's `id`.
+### Missing Parent Cards
 
-```python
-response = client.create_item("User Story", title="My Story", state="New", description="Details here")
-item_id = response["id"]
-```
+**Symptom:** Subtask is created but description says "Parent not found in ADO".
 
-#### `update_field(item_id, field, text)`
-Updates a single field on a work item using a JSON patch operation.
+**Cause:** Parent card was not migrated or not yet migrated when subtask tried to link.
 
-```python
-client.update_field(12345, "/fields/System.State", "Active")
-client.update_field(12345, "/fields/Custom.PriorityLevel", "2-High")
-```
+**Solution:** The migration worker now creates subtasks even with missing parents and falls back to a Jira URL hyperlink. If you want to relink to ADO parent later:
+1. Migrate the parent card
+2. Manually update the subtask description or link
 
-#### `append_description(item_id, add_text)`
-Appends HTML text to the end of a work item's existing description.
+### Unknown Identity (Display Names)
 
-```python
-client.append_description(12345, "<b>Reporter:</b> John Smith")
-```
+**Symptom:** Assignee field shows name like "CJ" or "System User", not the actual person.
 
-#### `create_attachment(filename, attachment)`
-Uploads an attachment to ADO. Returns the response containing the attachment `url`.
+**Cause:** The identity does not exist in ADO's identity system (display name not recognized).
 
-```python
-response = client.create_attachment("screenshot.png", file_content)
-attachment_url = response["url"]
-```
+**Solution:** Worker script falls back to description text. Check `worker_jira_to_ado_copy.log` for "identity fallback" warnings. Manually assign the card in ADO if needed.
 
-#### `add_attachment(item_id, attachment_url, author, created_date)`
-Links an uploaded attachment to a work item with author and date metadata.
+### Pagination Capped at 1000
 
-```python
-client.add_attachment(12345, attachment_url, "user@example.com", "2025-01-15T10:30:00.000+0000")
-```
+**Symptom:** Gap analysis shows only 1000 items migrated when filter returns 1521.
 
-#### `add_comments(item_id, attachment_dict, comments)`
-Adds a list of Jira comments to a work item. Updates any embedded image references using the provided `attachment_dict` (a mapping of `filename -> ADO attachment URL`).
+**Cause:** Old worker script used `maxResults=1000` hard-coded limit without pagination.
 
-```python
-client.add_comments(12345, {"image.png": "https://dev.azure.com/..."}, comments_list)
-```
+**Solution:** Current worker script uses cursor-based pagination (via `nextPageToken`). Migration gap analysis script (`migration_gap_analysis.py`) also uses cursor-based pagination and correctly identifies all cards.
 
-#### `add_hyperlink(item_id, hyperlink, author=None, last_update=None)`
-Adds a hyperlink relation to a work item. Optionally includes author and timestamp metadata.
+### Area Path Not Set
 
-```python
-client.add_hyperlink(12345, "https://github.com/org/repo/pull/1", "dev@example.com", "2025-01-15T10:30:00.000+0000")
-```
+**Symptom:** Card migrated to ADO but area path is missing.
 
-#### `format_date(date_string)`
-Converts a Jira timestamp string (ISO 8601 with timezone) to `YYYY-MM-DD HH:MM UTC-6` format.
+**Cause:** Worker script doesn't set area path; cards default to root. Gap analysis classifies as `no_area_path`.
 
-```python
-formatted = client.format_date("2025-01-15T10:30:00.000+0000")
-# Returns: "2025-01-15 10:30 UTC-6"
-```
+**Solution:** Use gap analysis CSV to identify affected cards, then move them in ADO or add area path during migration via custom field mapping.
 
-## Utility Reference: JiraClient
+### Filter ID vs Jira Key
 
-Located in `utilities/utils_jira.py`. Initialize with a config:
+**Jira Filter ID:**
+- Numeric ID from saved Jira filter (e.g., `11657`)
+- Returns multiple cards (potentially 1000s)
+- Use for bulk migration: `--jira-filter 11657`
 
-```python
-from utils_jira import JiraClient, load_jira_config
+**Jira Key:**
+- Unique identifier for single card (e.g., `OP-1480`)
+- Identifies exactly one card
+- Use for specific cards: `--jira-keys "OP-1480,OP-824"`
 
-config = load_jira_config("healthfinch")
-client = JiraClient(config)
-```
+---
 
-When `load_jira_config` is called with an instance name, it builds the server URL as `https://<instance>.atlassian.net` and uses the `email` and `access_token` from the config file. When called without an argument, it uses the `server` value from the config file directly.
+## Recent Changes (Current vs Production)
 
-### Methods
+**+3,379 insertions, -233 deletions across 9 files**
 
-#### `get_jira_issue(issue_key)`
-Retrieves a single Jira issue by key or ID, including rendered fields (HTML descriptions).
+### New Files
+- `migration_gap_analysis.py` (591 lines) — Identify missed/misaligned cards
+- Enhanced `verify_migration.py` (890 lines) — Per-field verification with HTML reports
 
-```python
-issue = client.get_jira_issue("PROJ-123")
-title = issue["fields"]["summary"]
-description = issue["renderedFields"]["description"]
-```
+### Enhanced Core Features
+- **Graceful parent handling** — Subtasks created with hyperlink fallback
+- **Attachment dedup** — Remove duplicate attachments before upload
+- **Jira key tagging** — Automatic `jiraKey=<KEY>` tag on all migrated items
+- **Identity fallback** — Use description text when assignee not found in ADO
+- **Cursor-based pagination** — Fetch all Jira items, not just first 1000
+- **3-attempt retry** — Exponential backoff for transient attachment failures (503 timeout)
+- **Comprehensive logging** — Ready-to-run `--retry-failed` command in summary
 
-#### `get_filter_items(filter_id)`
-Executes a saved Jira filter and returns matching issues (up to 1000).
+### Configuration Updates
+- `state_config.json` — Added Epics, Backlog, Draft, Declined, In Development, etc.
+- `type_config.json` — Added Subtask, New Feature mappings
 
-```python
-results = client.get_filter_items("54321")
-issues = results["issues"]
-```
+---
 
-#### `get_comments(issue_key)`
-Retrieves all comments on an issue with rendered HTML bodies.
+## Quick Reference: Common Commands
 
-```python
-response = client.get_comments("PROJ-123")
-comments = response["comments"]
-```
-
-#### `get_attachment(url)`
-Downloads attachment content from a Jira attachment URL.
-
-```python
-content = client.get_attachment("https://your-instance.atlassian.net/rest/api/3/attachment/content/12345")
-```
-
-#### `get_pull_request(issue_key)`
-Retrieves GitHub pull request and branch data linked to a Jira issue via the dev-status API.
-
-```python
-response = client.get_pull_request("10001")
-pr_url = response["detail"][0]["pullRequests"][0]["url"]
-```
-
-> Note: This uses Jira's internal dev-status API which is undocumented and unsupported by Atlassian.
-
-#### `get_users()`
-Retrieves a list of Jira users (up to 1000).
-
-```python
-users = client.get_users()
-```
+| Task | Command |
+|---|---|
+| Migrate by filter | `python3 worker_jira_to_ado_copy.py --jira-instance healthfinch --jira-filter YOUR-FILTER-ID --ado-project "Embedded Refills Engineering"` |
+| Migrate specific cards | `python3 worker_jira_to_ado_copy.py --jira-instance healthfinch --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2" --ado-project "Embedded Refills Engineering"` |
+| Find migration gaps | `python3 migration_gap_analysis.py --jira-instance healthfinch --jira-filter YOUR-FILTER-ID --ado-board "YOUR-BOARD" --ado-project "Embedded Refills Engineering" --csv gaps.csv` |
+| Verify all cards in project | `python3 verify_migration.py --jira-instance healthfinch --project-key YOUR-PROJECT-KEY --ado-project "Embedded Refills Engineering"` |
+| Verify specific cards | `python3 verify_migration.py --jira-instance healthfinch --jira-keys "YOUR-CARD-ID,YOUR-CARD-ID-2" --ado-project "Embedded Refills Engineering"` |
+| Debug attachment issues | `python3 worker_jira_to_ado_copy.py --jira-instance healthfinch --jira-keys "YOUR-CARD-ID" --ado-project "Embedded Refills Engineering" --skip-attachments` |

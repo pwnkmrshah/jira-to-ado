@@ -112,7 +112,7 @@ class JiraClient:
             'jql': jql,
             'startAt': 0,
             'maxResults': 1000,
-            'fields':'id'
+            'fields':'key'
         }
 
         try:
@@ -123,6 +123,33 @@ class JiraClient:
             logger.error(f"Unexpected error while executing JQL {jql}: {str(e)}")
 
         return None
+
+    def search_issues(self, jql):
+        """Execute a JQL search and return matching issues.
+        
+        Args:
+            jql: JQL query string (e.g., 'project = DATA')
+        
+        Returns:
+            Response dict with 'issues' key containing list of issues, each with 'key' field
+        """
+        url = f'{self.server}/rest/api/3/search'
+        payload = {
+            'jql': jql,
+            'startAt': 0,
+            'maxResults': 1000,
+            'fields': 'key'
+        }
+
+        try:
+            response = self.jira_api_call('GET', url, payload)
+            if response:
+                logger.info(f"[search_issues] JQL '{jql}' returned {len(response.get('issues', []))} issues")
+            return response
+
+        except Exception as e:
+            logger.error(f"Unexpected error while executing JQL '{jql}': {str(e)}")
+            return None
 
     def get_users(self):
         # Get list of Jira users

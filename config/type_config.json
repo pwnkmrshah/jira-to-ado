@@ -12,5 +12,7 @@
     "Incident": "Issue",
     "Incident Remediation": "Issue",
     "Sub-task": "Task",
-    "Sub-Task": "Task"
+    "Sub-Task": "Task",
+    "Subtask": "Task",
+    "New Feature": "Issue"
 }

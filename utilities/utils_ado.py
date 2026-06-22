@@ -10,6 +10,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import urlparse, parse_qs, unquote
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -293,7 +294,7 @@ class AzureDevOpsClient:
 
         payload = [
             {
-                'op': 'add',
+                'op': 'replace',  # 'add' silently fails on already-existing fields; 'replace' always wins
                 'path': field,
                 'value': text
             }
@@ -376,6 +377,11 @@ class AzureDevOpsClient:
     def find_work_item_by_jira_key(self, jira_key: str):
         """Search ADO via WIQL for a work item tagged with JiraKey=<jira_key>.
 
+        Uses CONTAINS for the WIQL query (ADO doesn't support exact tag match),
+        then validates the returned item actually carries the exact tag to avoid
+        false positives when an ADO item has multiple JiraKey= tags (phantom tags
+        from interrupted migration runs).
+
         Returns the integer ADO work item ID, or None if not found.
         """
         url = f'{self.organization_url}/{self.project}/_apis/wit/wiql?api-version=7.0'
@@ -386,15 +392,27 @@ class AzureDevOpsClient:
                 f"ORDER BY [System.Id] ASC"
             )
         }
+        expected_tag = f'JiraKey={jira_key}'
         try:
             response = self.ado_api_call('POST', url, query)
             if response and response.get('workItems'):
-                return response['workItems'][0]['id']
+                # Validate each candidate — CONTAINS can match phantom tags on shared items.
+                # Return the first ADO item whose tag list contains an exact match.
+                ids = ','.join(str(w['id']) for w in response['workItems'])
+                detail = self.ado_api_call('GET',
+                    f'{self.organization_url}/_apis/wit/workitems'
+                    f'?ids={ids}&fields=System.Id,System.Tags&api-version={self.api_version}')
+                if detail and detail.get('value'):
+                    for item in detail['value']:
+                        tags_str = item.get('fields', {}).get('System.Tags', '') or ''
+                        tag_set = {t.strip() for t in tags_str.split(';') if t.strip()}
+                        if expected_tag in tag_set:
+                            return item['id']
         except Exception as e:
             logging.warning(f"[find_work_item_by_jira_key] Search failed for {jira_key}: {e}")
         return None
 
-    def bulk_fetch_jira_key_mapping(self, jira_keys: list) -> dict:
+    def bulk_fetch_jira_key_mapping(self, jira_keys: list, skip_title_search: bool = False) -> dict:
         """Fetch ADO work item IDs for all given Jira keys.
 
         Two-pass strategy — both passes run for ALL keys so duplicates are resolved:
@@ -411,7 +429,7 @@ class AzureDevOpsClient:
             return {}
 
         candidates = {k: [] for k in jira_keys}
-        batch_size = 50
+        batch_size = 10
 
         # ---- Pass 1: tag search ----
         for i in range(0, len(jira_keys), batch_size):
@@ -435,15 +453,23 @@ class AzureDevOpsClient:
                         tag = tag.strip()
                         if tag.startswith('JiraKey='):
                             key = tag[len('JiraKey='):]
+                            # Do NOT break — one ADO item may carry multiple JiraKey= tags
+                            # (phantom tags from interrupted runs). Scan all of them so
+                            # every key present on the item is properly attributed.
                             if key in candidates and item['id'] not in candidates[key]:
                                 candidates[key].append(item['id'])
-                            break
             except Exception as e:
                 logging.warning(f"[bulk_fetch_jira_key_mapping] Tag batch {i//batch_size+1} failed: {e}")
 
         # ---- Pass 2: title search (catches untagged originals) ----
-        for i in range(0, len(jira_keys), batch_size):
-            batch = jira_keys[i:i + batch_size]
+        # Only search keys not already found via tags; if skip_title_search is set,
+        # bypass entirely (safe for fresh migrations where no untagged ADO items exist).
+        if skip_title_search:
+            keys_for_title = []
+        else:
+            keys_for_title = [k for k in jira_keys if not candidates[k]]
+        for i in range(0, len(keys_for_title), batch_size):
+            batch = keys_for_title[i:i + batch_size]
             conditions = " OR ".join(f"[System.Title] CONTAINS '[{k}]'" for k in batch)
             url = f'{self.organization_url}/{self.project}/_apis/wit/wiql?api-version=7.0'
             try:
@@ -459,10 +485,16 @@ class AzureDevOpsClient:
                     continue
                 for item in detail['value']:
                     title = item.get('fields', {}).get('System.Title', '') or ''
-                    for token in _re.findall(r'\[([A-Z]+-\d+)\]', title):
-                        if token in candidates and item['id'] not in candidates[token]:
-                            candidates[token].append(item['id'])
-                        break
+                    tokens = _re.findall(r'\[([A-Z]+-\d+)\]', title)
+                    # Only match the LAST [KEY] token in the title.
+                    # ADO titles have the format "[PARENT-KEY] [CHILD-KEY] Summary"
+                    # for child issues. Using only the last token prevents the
+                    # parent key from being falsely matched to the child's ADO item,
+                    # which would create phantom duplicate mappings.
+                    if tokens:
+                        last_token = tokens[-1]
+                        if last_token in candidates and item['id'] not in candidates[last_token]:
+                            candidates[last_token].append(item['id'])
             except Exception as e:
                 logging.warning(f"[bulk_fetch_jira_key_mapping] Title batch {i//batch_size+1} failed: {e}")
 
@@ -502,18 +534,32 @@ class AzureDevOpsClient:
         return item is not None and 'id' in item
 
     def get_work_item_comment_texts(self, ado_id: int) -> list:
-        """Return a list of existing comment text strings for deduplication."""
+        """Return a list of existing comment text strings for deduplication.
+
+        Fetches all pages (ADO returns max 200 per page via continuationToken).
+        """
+        texts = []
         url = (
             f'{self.organization_url}/{self.project}/_apis/wit/workItems/{ado_id}'
             f'/comments?api-version={self.api_version}'
         )
         try:
-            response = self.ado_api_call('GET', url)
-            if response and 'comments' in response:
-                return [c.get('text', '') for c in response['comments']]
+            while url:
+                response = self.ado_api_call('GET', url)
+                if not response or 'comments' not in response:
+                    break
+                texts.extend(c.get('text', '') for c in response['comments'])
+                token = response.get('continuationToken')
+                if token:
+                    url = (
+                        f'{self.organization_url}/{self.project}/_apis/wit/workItems/{ado_id}'
+                        f'/comments?continuationToken={token}&api-version={self.api_version}'
+                    )
+                else:
+                    url = None
         except Exception as e:
             logging.warning(f"[get_work_item_comment_texts] Could not fetch comments for {ado_id}: {e}")
-        return []
+        return texts
 
     def get_work_item_relation_urls(self, ado_id: int) -> list:
         """Return a list of existing relation URL strings for deduplication."""
@@ -521,6 +567,76 @@ class AzureDevOpsClient:
         if item and 'relations' in item:
             return [r.get('url', '') for r in item.get('relations', [])]
         return []
+
+    def _attachment_name_from_relation(self, relation: dict) -> str:
+        """Best-effort filename extraction for an AttachedFile relation."""
+        attrs = relation.get('attributes') or {}
+        if attrs.get('name'):
+            return attrs['name']
+
+        rel_url = relation.get('url', '')
+        try:
+            parsed = urlparse(rel_url)
+            qs = parse_qs(parsed.query)
+            if qs.get('fileName'):
+                return unquote(qs['fileName'][0])
+            basename = unquote(parsed.path.rsplit('/', 1)[-1])
+            return basename if basename and basename != 'attachments' else ''
+        except Exception:
+            return ''
+
+    def _attachment_signature(self, relation: dict):
+        """Stable signature used to detect duplicate attachment relations."""
+        attrs = relation.get('attributes') or {}
+        name = (self._attachment_name_from_relation(relation) or '').strip().lower()
+        rel_url = relation.get('url', '')
+        try:
+            parsed = urlparse(rel_url)
+            canonical_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path}'.lower()
+        except Exception:
+            canonical_url = rel_url.lower()
+
+        # Filename is the most stable identity across reruns (URL changes on re-upload,
+        # author/comment strings can vary between historical migrations).
+        if name:
+            return ('name', name)
+        return ('url', canonical_url)
+
+    def remove_duplicate_attachment_relations(self, item_id: int) -> int:
+        """Remove duplicate AttachedFile relations from a work item.
+
+        Duplicates are detected by logical attachment signature; relation indices
+        are removed in descending order so patch offsets remain valid.
+
+        Returns number of removed relations.
+        """
+        item = self.get_work_item_full(item_id)
+        relations = (item or {}).get('relations') or []
+        seen = {}
+        dup_indices = []
+
+        for idx, rel in enumerate(relations):
+            if rel.get('rel') != 'AttachedFile':
+                continue
+            sig = self._attachment_signature(rel)
+            if sig in seen:
+                dup_indices.append(idx)
+            else:
+                seen[sig] = idx
+
+        if not dup_indices:
+            return 0
+
+        url = (
+            f'{self.organization_url}/{self.project}/_apis/wit/workitems/{item_id}'
+            f'?api-version={self.api_version}'
+        )
+        payload = [
+            {'op': 'remove', 'path': f'/relations/{idx}'}
+            for idx in sorted(dup_indices, reverse=True)
+        ]
+        self.ado_api_call('PATCH', url, payload)
+        return len(dup_indices)
 
     def ensure_jira_key_tag(self, ado_id: int, jira_key: str) -> None:
         """Add 'JiraKey=<jira_key>' tag to the work item if not already present.
@@ -532,7 +648,8 @@ class AzureDevOpsClient:
         if item:
             existing_tags = (item.get('fields', {}).get('System.Tags') or '').strip()
         tag = f'JiraKey={jira_key}'
-        if tag not in existing_tags:
+        tag_set = {t.strip() for t in existing_tags.split(';') if t.strip()}
+        if tag not in tag_set:  # exact set membership — avoids 'JiraKey=ENG-9' matching 'JiraKey=ENG-92'
             tag_parts = [t.strip() for t in existing_tags.split(';') if t.strip()] if existing_tags else []
             tag_parts.append(tag)
             self.update_field(ado_id, '/fields/System.Tags', '; '.join(tag_parts))
@@ -764,4 +881,38 @@ class AzureDevOpsClient:
         ]
         logging.debug(f"[add_work_item_link] Linking {item_id} --[{relation_type}]--> {target_ado_id}")
         return self.ado_api_call('PATCH', url, payload)
+
+    def ensure_jira_key_tag(self, ado_id: int, jira_key: str):
+        """Add or update the jiraKey tag on an ADO work item.
+        
+        Ensures that the tag 'jiraKey=<jira_key>' exists on the item.
+        Preserves existing tags and merges the jiraKey tag.
+        """
+        try:
+            item = self.get_work_item_full(ado_id)
+            if not item:
+                logging.warning(f"[ensure_jira_key_tag] Could not fetch item {ado_id} to add jiraKey tag")
+                return False
+            
+            # Get existing tags
+            existing_tags_str = item.get('fields', {}).get('System.Tags', '') or ''
+            tag_parts = [t.strip() for t in existing_tags_str.split(';') if t.strip()]
+            
+            # Check if jiraKey tag already exists
+            jira_key_tag = f'jiraKey={jira_key}'
+            if jira_key_tag in tag_parts:
+                logging.debug(f"[ensure_jira_key_tag] jiraKey tag already exists on {ado_id}: {jira_key_tag}")
+                return True
+            
+            # Add the jiraKey tag
+            tag_parts.append(jira_key_tag)
+            updated_tags = '; '.join(tag_parts)
+            
+            # Update the item with the new tags
+            self.update_field(ado_id, '/fields/System.Tags', updated_tags)
+            logging.info(f"[ensure_jira_key_tag] Added jiraKey tag to {ado_id}: {jira_key_tag}")
+            return True
+        except Exception as e:
+            logging.error(f"[ensure_jira_key_tag] Error adding jiraKey tag to {ado_id}: {e}")
+            return False
 

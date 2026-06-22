@@ -3,6 +3,7 @@
     "Default": "New",
     "Draft Eng": "New",
     "Draft CS": "New",
+    "Epics": "New",
     "In Progress": "Active",
     "In Review": "Active",
     "Prioritized": "New",
@@ -14,5 +15,14 @@
     "Deployed": "Completed",
     "Shelved": "Removed",
     "Won't Do": "Removed",
-    "WONT DO": "Removed"
+    "WONT DO": "Removed",
+    "Ready for Customer": "New",
+    "Backlog": "New",
+    "To Do": "New",
+    "Selected for Development": "New",
+    "Draft": "New",
+    "Declined": "Removed",
+    "Approved": "New",
+    "In Refinement": "New",
+    "In Development": "Active"
 }
