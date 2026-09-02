@@ -7,6 +7,167 @@ Complete migration suite for copying work items from Jira to Azure DevOps with v
 2. **`migration_gap_analysis.py`** — Identify missing or misaligned cards after migration
 3. **`verify_migration.py`** — Verify field-by-field accuracy of migrated items
 
+**API bridge (Forge integration):**
+- **`api_server.py`** — Flask HTTP server that wraps the three tools above. Used when the Jira Forge app (`jira-ado-migrator-forge-app`) triggers migrations from the browser UI instead of the CLI.
+
+---
+
+## Architecture: Forge App ↔ Local Scripts
+
+The Forge app runs in Atlassian's cloud (sandboxed Node.js). The Python scripts run on this local machine. They can't talk directly — `api_server.py` is the bridge.
+
+```
+User clicks "Migrate to ADO" in Jira (browser)
+        │
+        ▼
+Forge frontend (Atlassian cloud iframe)
+        │  invoke('migrate', { jiraFilter, adoProject })
+        ▼
+Forge backend resolver (Atlassian Lambda — src/index.js)
+        │  POST https://<ngrok-id>.ngrok.io/migrate
+        │  Header: X-API-Key: <MIGRATION_API_KEY>
+        ▼
+ngrok tunnel  (port-forwards to localhost:5001)
+        │
+        ▼
+api_server.py  (Flask, localhost:5001)
+        │  subprocess.run(['python3', 'worker_jira_to_ado_copy.py', ...])
+        ▼
+worker_jira_to_ado_copy.py
+        ├── reads config/jira_config.json   → calls healthfinch.atlassian.net
+        └── reads config/ado_config.json    → creates work items in ADO
+```
+
+**Everything runs locally.** ngrok is just a public HTTPS tunnel so Atlassian's servers can reach `localhost:5001`. The actual Jira reads and ADO writes happen from this machine using the credentials in `config/`.
+
+---
+
+## Running the API Server
+
+### Prerequisites
+
+```bash
+pip install flask
+# requests is already in requirements.txt
+```
+
+### Start the server
+
+```bash
+cd /home/pawan/ferret/repos/jira-to-ado
+export MIGRATION_API_KEY=demo-key-change-me
+python3 api_server.py
+# → Running on http://127.0.0.1:5001
+```
+
+**ADO credentials are loaded automatically** from `config/ado_config.json` — no need to export `ADO_ORG` or `ADO_PAT` manually. The config file uses these keys:
+
+```json
+{
+  "organization": "healthcatalyst",
+  "access_token": "<your ADO PAT>",
+  "username": "...",
+  "project": "..."
+}
+```
+
+> ⚠️ The fallback reads `organization` (not `organization_url`). If the key name differs, set `ADO_ORG` and `ADO_PAT` as environment variables instead and they will take priority.
+
+### If port 5001 is already in use
+
+```bash
+kill $(lsof -ti:5001)
+# then restart
+```
+
+### Verify endpoints are working
+
+```bash
+# Health (no auth)
+curl http://localhost:5001/health
+
+# ADO projects (requires API key)
+curl -H "X-API-Key: demo-key-change-me" http://localhost:5001/ado-projects
+
+# Connection ping (requires API key)
+curl -H "X-API-Key: demo-key-change-me" http://localhost:5001/ping
+```
+
+### API Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | None | Server liveness check |
+| `POST` | `/migrate` | X-API-Key | Start a migration job |
+| `GET` | `/status/<job_id>` | X-API-Key | Poll job status and output |
+| `POST` | `/gaps` | X-API-Key | Run gap analysis |
+| `POST` | `/verify` | X-API-Key | Run verification |
+
+#### POST /migrate — Body
+
+```json
+{
+  "jira_instance": "healthfinch",
+  "ado_project": "Embedded Refills Engineering",
+  "jira_filter": "11657",
+  "jira_keys": "",
+  "skip_attachments": false
+}
+```
+
+Provide `jira_filter` **or** `jira_keys`, not both. Returns `{ job_id, status: "queued" }` immediately (HTTP 202). The migration runs in the background.
+
+#### GET /status/<job_id> — Response
+
+```json
+{
+  "status": "running",
+  "command": "python3 ... --jira-filter 11657",
+  "output": "...(last 8000 chars of stdout)...",
+  "error": "...(last 3000 chars of stderr)...",
+  "return_code": null,
+  "started_at": "2026-08-09T10:00:00Z",
+  "finished_at": null
+}
+```
+
+`status` cycles through: `queued` → `running` → `completed` | `failed`
+
+#### POST /gaps — Body
+
+```json
+{
+  "jira_instance": "healthfinch",
+  "jira_filter": "11657",
+  "ado_board": "Operations",
+  "ado_project": "Embedded Refills Engineering"
+}
+```
+
+Returns `{ job_id, report: "/abs/path/to/gaps_<ts>.csv" }`. CSV is saved locally in `reports/`.
+
+#### POST /verify — Body
+
+```json
+{
+  "jira_instance": "healthfinch",
+  "ado_project": "Embedded Refills Engineering",
+  "project_key": "OP",
+  "jira_keys": ""
+}
+```
+
+Returns `{ job_id, report: "/abs/path/to/verify_<ts>.html" }`. HTML report saved in `reports/`.
+
+### Security Notes
+
+- `MIGRATION_API_KEY` must match on both sides (Flask server env var + Forge app env var)
+- The `/health` endpoint has no auth (needed for Forge to verify reachability)
+- ngrok free tier generates a new URL each restart — update manifest egress when it changes
+- For production: deploy `api_server.py` to a stable host (EC2, Railway, Render) and use a fixed URL
+
+---
+
 ## Setup
 
 ### Access Tokens

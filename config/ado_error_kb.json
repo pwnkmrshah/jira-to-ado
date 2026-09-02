@@ -1,0 +1,38 @@
+{
+  "_comment": "ADO error code knowledge base. Add new entries here — no Python changes needed.",
+  "VS403074": {
+    "short": "Work item type '{type}' is not enabled in this ADO project.",
+    "action": "Ask your ADO admin to go to Project Settings → Boards → Process → Work item types and enable '{type}'.",
+    "who": "ADO project admin"
+  },
+  "TF401320": {
+    "short": "A required field is missing a value.",
+    "action": "Ask your ADO admin to make the field optional or set a default value for it in the process settings.",
+    "who": "ADO project admin"
+  },
+  "VS402337": {
+    "short": "The work item is too large to save (description or attachments exceed the ADO size limit).",
+    "action": "Re-run with 'Skip file attachments' enabled, or split the card into smaller pieces.",
+    "who": "Migration operator"
+  },
+  "TF26027": {
+    "short": "Work item type '{type}' does not exist in this ADO project.",
+    "action": "Check the ADO project process settings, or update type_config.json to map to an existing type.",
+    "who": "ADO project admin"
+  },
+  "VS403283": {
+    "short": "You don't have permission to create work items in this project.",
+    "action": "Ask your ADO admin for Contributor access on this project.",
+    "who": "ADO project admin"
+  },
+  "TF400898": {
+    "short": "The work item state '{state}' is not valid for this work item type.",
+    "action": "Update state_config.json to map to a valid ADO state, or ask your ADO admin which states are available.",
+    "who": "Migration operator"
+  },
+  "VS403407": {
+    "short": "The area path is not valid for this project.",
+    "action": "Verify the ADO project has the expected area paths configured.",
+    "who": "ADO project admin"
+  }
+}

@@ -615,6 +615,7 @@ def main():
     parser.add_argument('--project-key')
     parser.add_argument('--ado-project', required=True)
     parser.add_argument('--output', default='migration_verification_report.html')
+    parser.add_argument('--csv-output', default='', help='Write per-card verification CSV to this path')
     parser.add_argument('--verbose', action='store_true', help='Print detailed logs')
     parser.add_argument('--list-keys', action='store_true', help='List resolved Jira keys and exit')
 
@@ -869,6 +870,25 @@ def main():
             print(f"❌ {key} → FAILED (see log)")
         elif idx % 50 == 0:
             print(f"✅ Processed {idx}/{len(jira_keys)}")
+
+    # ✅ Write CSV if requested
+    if args.csv_output and results:
+        import csv as _csv
+        with open(args.csv_output, 'w', newline='') as _f:
+            w = _csv.writer(_f)
+            w.writerow(['jira_key', 'ado_id', 'migration_status', 'failed_checks', 'details'])
+            for r in results:
+                if not r['found_in_ado']:
+                    status, failed, details = 'not_found', '', 'Item not found in ADO'
+                elif r['all_pass']:
+                    status, failed, details = 'verified', '', ''
+                else:
+                    failed_items = [(n, c) for n, c in r['checks'].items() if not c['pass']]
+                    status = 'warnings'
+                    failed = ' | '.join(n for n, _ in failed_items)
+                    details = ' | '.join(c['note'] for _, c in failed_items if c.get('note'))
+                w.writerow([r['jira_key'], r.get('ado_id', ''), status, failed, details])
+        logging.info(f'CSV written to {args.csv_output} ({len(results)} rows)')
 
     # ✅ Summary
     total = len(results)

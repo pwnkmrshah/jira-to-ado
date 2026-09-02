@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Add the utilities directory to the path to import utils_ado
 sys.path.append(str(Path(__file__).parent.parent.parent / "utilities"))
-from utils_ado import AzureDevOpsClient, load_ado_config
+from utils_ado import AzureDevOpsClient, load_ado_config, WorkItemTypeDisabledError
 from utils_jira import JiraClient, load_jira_config
 from utils_mapping import load_issue_mapping, save_issue_mapping
 
@@ -42,6 +42,10 @@ JIRA_CONTENT_PATTERN = re.compile(
     r'https://healthfinch\.atlassian\.net/rest/api/3/attachment/content/(\d+)'
 )
 JIRA_COMMENT_MARKER_PATTERN = re.compile(r'JiraCommentId:(\d+)')
+
+# Fallback type order when the primary type is disabled in the target ADO project (VS403074).
+# The worker will try each in turn until one succeeds.
+_TYPE_FALLBACKS = ['User Story', 'Bug', 'Feature', 'Epic', 'Product Request', 'Problem']
 
 # ---------------------------------------------------------------------------
 # Failed-issue tracking
@@ -219,17 +223,20 @@ def build_parsed_fields(jira_ticket: dict, type_config: dict, state_config: dict
     # Use email when available; fall back to display name for archived projects
     assignee = assignee_email or assignee_name or None
 
-    state     = jira_ticket['fields']['status']['name']
-    jira_type = jira_ticket['fields']['issuetype']['name']
-    description = jira_ticket['renderedFields']['description'] or ''
+    state     = (jira_ticket['fields'].get('status') or {}).get('name', '')
+    jira_type = (jira_ticket['fields'].get('issuetype') or {}).get('name', '')
+    description = (jira_ticket.get('renderedFields') or {}).get('description') or ''
 
     # Append customer info to description when present
     customers = jira_ticket['fields'].get('customfield_10907')
     if customers:
-        description += '<p><b>Customers:</b></p>'
-        customers_content = jira_ticket['fields']['customfield_10907']['content'][0]['content']
-        for customer in customers_content:
-            description += f'{customer["text"]}<br />'
+        try:
+            description += '<p><b>Customers:</b></p>'
+            customers_content = jira_ticket['fields']['customfield_10907']['content'][0]['content']
+            for customer in customers_content:
+                description += f'{customer["text"]}<br />'
+        except Exception:
+            pass
 
     if (ado_type := type_config.get(jira_type)) is None:
         ado_type = type_config.get('Default')
@@ -581,20 +588,77 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     if ado_id:
         logging.info(f"[UPDATE] Updating existing ADO item {ado_id} for Jira {jira_key}")
         ado_client.update_item_core_fields(ado_id, title, ado_state, None, description)
-        # Update work item type in case type_config.json changed (e.g. Task -> Issue)
+        # Always enforce the correct type — bypassRules=true required; idempotent if already correct
         try:
-            ado_client.update_field(ado_id, '/fields/System.WorkItemType', ado_type)
+            ado_client.change_work_item_type(ado_id, ado_type)
         except Exception as e:
-            logging.warning(f"[create_or_update_work_item] Could not update type to '{ado_type}' for {jira_key}: {e}")
+            logging.warning(f"[type-change] Could not set type '{ado_type}' for {jira_key}: {e}")
     else:
-        work_item = ado_client.create_item(ado_type, None, title, ado_state, None, description)
+        # Try the mapped type; if disabled in this project, fall back through _TYPE_FALLBACKS
+        tried_types = [ado_type] + [t for t in _TYPE_FALLBACKS if t != ado_type]
+        work_item = None
+        used_type = ado_type
+        for candidate_type in tried_types:
+            try:
+                work_item = ado_client.create_item(candidate_type, None, title, ado_state, None, description)
+                used_type = candidate_type
+                break
+            except WorkItemTypeDisabledError as exc:
+                logging.warning(f"[create_or_update_work_item] {exc} — trying next fallback type for {jira_key}")
+                continue
         if work_item is None:
             logging.error(f"[create_or_update_work_item] Failed to create ADO item for {jira_key}")
             return None
+        if used_type != ado_type:
+            logging.warning(f"[create_or_update_work_item] Used fallback type '{used_type}' (mapped type '{ado_type}' is disabled) for {jira_key}")
         ado_id = work_item['id']
         save_issue_mapping(jira_key, ado_id)
         mapping[jira_key] = ado_id   # keep in-memory mapping current
         logging.info(f"[CREATE] Created ADO item {ado_id} for Jira {jira_key}")
+
+    # ---- Area path — set immediately so later exceptions cannot skip it ----
+    if detected_team_name:
+        _ap_team = detected_team_name.strip()
+    else:
+        jira_project = jira_ticket['fields'].get('project') or {}
+        jira_project_key = jira_project.get('key', '')
+        if jira_project_key:
+            raw_project_name = jira_project.get('name', '') or jira_project_key
+            _ap_team = raw_project_name.replace('&', 'and')
+            _ap_team = re.sub(r'[\\/<>|:?*"]+', '-', _ap_team).strip(' -')
+            _ap_team = _ap_team if _ap_team else jira_project_key
+        else:
+            _ap_team = None
+    if _ap_team:
+        _ap_path = f'{ado_client.project}\\{_ap_team}'
+        logging.info(f"[area-path] {jira_key}: team='{_ap_team}' → area_path='{_ap_path}'")
+        if _ap_team not in _BOARD_SETUP_DONE:
+            team_exists = ado_client.ensure_team(_ap_team)
+            if team_exists:
+                print(f'[board-setup] Team "{_ap_team}" already exists in ADO — reusing it.')
+            ok_area = ado_client.ensure_area_path(_ap_team)
+            ok_cfg  = ado_client.configure_team_area(_ap_team, _ap_path)
+            ok_iter = ado_client.configure_team_iteration(_ap_team)
+            if ok_area and ok_cfg and ok_iter:
+                org_name = ado_client.organization_url.rstrip('/').split('/')[-1]
+                print(f'[board-setup] \u2705 Team "{_ap_team}" ready — '
+                      f'https://dev.azure.com/{org_name}/{ado_client.project.replace(" ", "%20")}'
+                      f'/_boards/board/t/{_ap_team.replace(" ", "%20")}/Stories%20Risks%20and%20Insights')
+            else:
+                print(f'[board-setup] \u26a0\ufe0f  Some board setup steps failed for "{_ap_team}"')
+            _BOARD_SETUP_DONE.add(_ap_team)
+        # Retry up to 3x — re-ensure area node on each retry so it's truly mandatory
+        for _attempt in range(3):
+            try:
+                ado_client.update_field(ado_id, '/fields/System.AreaPath', _ap_path)
+                logging.info(f"[area-path] \u2705 {jira_key} → '{_ap_path}'")
+                break
+            except Exception as _e:
+                if _attempt < 2:
+                    logging.debug(f"[area-path] retry {_attempt + 1} for {jira_key}: {_e}")
+                    ado_client.ensure_area_path(_ap_team)  # re-create node if it vanished
+                else:
+                    logging.warning(f"[area-path] \u274c Could not set '{_ap_path}' for {jira_key} after 3 attempts: {_e}")
 
     # ---- Assignee: set System.AssignedTo in ADO when possible ----
     # Try email first (exact match), then display name (ADO fuzzy resolve).
@@ -616,9 +680,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             except Exception:
                 continue
         if not assignee_set_in_ado:
-            logging.warning(
-                f"[create_or_update_work_item] Could not assign {display_name} in ADO for {jira_key} — description fallback used"
-            )
+            logging.info(f"[assignee] {display_name} not in ADO for {jira_key} — stored in description")
             assignee_line = (
                 f'<b>Assignee:</b> {display_name} ({assignee})'
                 if assignee != display_name
@@ -648,9 +710,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         except Exception:
             continue
     if not reporter_set_in_ado:
-        logging.warning(
-            f"[create_or_update_work_item] Could not set reporter {reporter_display} in ADO for {jira_key} — description fallback used"
-        )
+        logging.info(f"[reporter] {reporter_display} not in ADO for {jira_key} — stored in description")
         reporter_line = (
             f'<b>Reporter:</b> {reporter_display} ({reporter_email})'
             if reporter_email else
@@ -666,20 +726,24 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         logging.warning(f"[create_or_update_work_item] Could not upsert reporter/assignee lines for {jira_key}: {e}")
 
     # ---- Custom fields ----
-    logging.info(f"[main] Updating custom fields for: {ado_id}")
+    logging.debug(f"[main] Updating custom fields for: {ado_id}")
     sync_custom_fields(ado_id, jira_ticket, ado_client, custom_fields)
-    logging.info(f"[main] Finished updating custom fields for: {ado_id}")
+    logging.debug(f"[main] Finished updating custom fields for: {ado_id}")
 
     # ---- Priority ----
-    if field := jira_ticket['fields']['priority']['name']:
-        match field:
-            case 'Highest': priority = '1-Critical'
-            case 'High':    priority = '2-High'
-            case 'Medium':  priority = '3-Medium'
-            case 'Low':     priority = '4-Low'
-            case 'Lowest':  priority = '4-Low'
-            case _:         priority = '3-Medium'
-        ado_client.update_field(ado_id, '/fields/Custom.PriorityLevel', priority)
+    _jira_prio = (jira_ticket['fields'].get('priority') or {}).get('name') or ''
+    match _jira_prio:
+        case 'Highest': _ado_prio = '1-Critical'
+        case 'High':    _ado_prio = '2-High'
+        case 'Medium':  _ado_prio = '3-Medium'
+        case 'Low':     _ado_prio = '4-Low'
+        case 'Lowest':  _ado_prio = '4-Low'
+        case _:         _ado_prio = '3-Medium'  # default when Jira priority is null
+    try:
+        ado_client.update_field(ado_id, '/fields/Custom.PriorityLevel', _ado_prio)
+        logging.info(f"[priority] ✅ {jira_key}: '{_jira_prio or '(none)'}' → '{_ado_prio}'")
+    except Exception as e:
+        logging.warning(f"[priority] ❌ {jira_key}: could not set '{_ado_prio}': {e}")
 
     # ---- Date fields ----
     # ONLY Actual Start Date is populated (from Jira created).
@@ -792,67 +856,6 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     # ---- Hyperlinks / linked issues ----
     sync_links(ado_id, jira_ticket, jira_client, jira_id, jira_instance, ado_client, mapping)
 
-    # ---- Board / Team / Area path: one ADO team per Jira project = one board ----
-    # Use the Jira project name exactly as it appears in Jira — no stripping or
-    # adding of any prefix. If Jira has "ZZ-Archive-X", that comes through as-is.
-    # Only sanitize characters that ADO area paths cannot contain.
-    # UNLESS detected_team_name is provided (auto-detected from Jira board),
-    # in which case ALL items go to that team, regardless of their source project.
-    
-    if detected_team_name:
-        # Auto-detected team: use for all items from this board/filter
-        team_name = detected_team_name.strip()
-        area_path = f'{ado_client.project}\\{team_name}'
-        logging.info(f"[area-path] {jira_key}: Auto-detected board → ADO team='{team_name}' → area_path='{area_path}'")
-    else:
-        # Default: derive team from the ticket's Jira project
-        jira_project = jira_ticket['fields'].get('project') or {}
-        jira_project_key = jira_project.get('key', '')
-        if jira_project_key:
-            raw_project_name = jira_project.get('name', '') or jira_project_key
-            # Sanitize: replace & with 'and' (ADO rejects & in area path names),
-            # then remove other chars ADO area paths don't support
-            team_name = raw_project_name.replace('&', 'and')
-            team_name = re.sub(r'[\\/<>|:?*"]+', '-', team_name).strip(' -')
-            team_name = team_name if team_name else jira_project_key
-            area_path = f'{ado_client.project}\\{team_name}'
-            
-            # DIAGNOSTIC: Log which team each card is being assigned to
-            logging.info(f"[area-path] {jira_key}: Jira project={jira_project_key} ({raw_project_name}) → ADO team='{team_name}' → area_path='{area_path}'")
-        else:
-            # No project found — skip area path setup
-            team_name = None
-            area_path = None
-            logging.warning(f"[area-path] {jira_key}: No Jira project found — skipping team/area setup")
-    
-    if team_name and area_path:
-        if team_name not in _BOARD_SETUP_DONE:
-            print(f'[board-setup] Configuring ADO team and board: {team_name} ...')
-            # Check if team already exists in ADO
-            team_exists = ado_client.ensure_team(team_name)
-            if team_exists:
-                print(f'[board-setup] Team "{team_name}" already exists in ADO — reusing it.')
-            ok_area = ado_client.ensure_area_path(team_name)
-            ok_cfg  = ado_client.configure_team_area(team_name, area_path)
-            ok_iter = ado_client.configure_team_iteration(team_name)
-            if ok_area and ok_cfg and ok_iter:
-                org_name = ado_client.organization_url.rstrip('/').split('/')[-1]
-                encoded_team = team_name.replace(' ', '%20')
-                encoded_project = ado_client.project.replace(' ', '%20')
-                print(f'[board-setup] ✅ Team "{team_name}" ready — board: '
-                      f'https://dev.azure.com/{org_name}/{encoded_project}'
-                      f'/_boards/board/t/{encoded_team}/Stories%20Risks%20and%20Insights')
-            else:
-                print(f'[board-setup] ⚠️  Some board setup steps failed for "{team_name}" — check logs')
-            _BOARD_SETUP_DONE.add(team_name)
-        try:
-            ado_client.update_field(ado_id, '/fields/System.AreaPath', area_path)
-        except Exception as e:
-            logging.warning(
-                f"[create_or_update_work_item] Could not set area path '{area_path}' "
-                f"for {jira_key}: {e}"
-            )
-
     # ---- JiraKey tag — applied last so other updates cannot remove it ----
     ado_client.ensure_jira_key_tag(ado_id, jira_key)
 
@@ -928,6 +931,7 @@ def main():
     parser = argparse.ArgumentParser(description='Jira to ADO Copy')
     parser.add_argument('--jira-instance', help='Jira source instance name (from URL)')
     parser.add_argument('--jira-filter',   help='Jira source filter ID')
+    parser.add_argument('--jira-jql',      help='JQL query string (AI migrate flow)')
     parser.add_argument('--ado-project',   help='ADO target project name')
     parser.add_argument('--project-key',   help='Board prefix (e.g. RRR) or ALL — reads keys from migration_mapping.json')
     parser.add_argument('--jira-keys',      help='Comma-separated list of Jira keys to process (e.g. CSQA-1,CSQA-5,CSQA-12)')
@@ -936,6 +940,27 @@ def main():
     parser.add_argument('--skip-attachments', action='store_true', help='Skip attachment uploads (useful if ADO is timing out on large files)')
 
     args = parser.parse_args()
+
+    # --jira-jql: resolve keys up-front so the existing --jira-keys path handles everything
+    if args.jira_jql and not args.jira_keys:
+        # Lazy-init jira client just for the search — full init happens below
+        _jcfg = load_jira_config(args.jira_instance) if args.jira_instance else load_jira_config('')
+        _jc   = JiraClient(_jcfg)
+        logging.info(f"[main] JQL mode: '{args.jira_jql}'")
+        print(f"[main] JQL mode: '{args.jira_jql}'")
+        _result = _jc.search_jql_paginated(args.jira_jql)
+        if not _result or not _result.get('issues'):
+            print(f'[main] JQL returned 0 issues — nothing to migrate.')
+            sys.exit(0)
+        _keys = [i['key'] for i in _result['issues'] if i.get('key')]
+        logging.info(f"[main] JQL returned {len(_keys)} issues")
+        print(f"[main] JQL returned {len(_keys)} issues")
+        args.jira_keys = ','.join(_keys)
+        # Auto-detect team name from JQL (e.g. project = "SCRUM" → SCRUM)
+        _m = re.search(r'project\s*=\s*["\']?([A-Za-z0-9_-]+)["\']?', args.jira_jql, re.IGNORECASE)
+        if _m and not getattr(args, '_detected_team', None):
+            args._detected_team = _m.group(1).strip()
+            print(f"[board-detect] Auto-detected Jira board from JQL: {args._detected_team}")
 
     # Only prompt for filter if neither --jira-keys/--project-key nor --retry-failed was supplied
     try:

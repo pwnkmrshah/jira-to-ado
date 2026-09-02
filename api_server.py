@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+"""
+api_server.py — HTTP bridge between the Forge app (Atlassian cloud) and the
+local migration scripts. Expose this server publicly via ngrok so the Forge
+backend function can reach it.
+
+Usage:
+    export MIGRATION_API_KEY=your-secret-key
+    python3 api_server.py
+
+Then in a separate terminal:
+    ngrok http 5001
+
+Pass the ngrok HTTPS URL to the Forge app via environment or manifest egress.
+"""
+
+import base64
+import json
+import logging
+import os
+import re
+import subprocess
+import threading
+import uuid
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+)
+
+REPO_ROOT = Path(__file__).parent
+SCRIPTS_DIR = REPO_ROOT / 'jira_ado_copy' / 'scripts'
+REPORTS_DIR = REPO_ROOT / 'reports'
+REPORTS_DIR.mkdir(exist_ok=True)
+
+# All jobs keyed by UUID: { status, command, output, error, return_code, started_at, finished_at }
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+# Set MIGRATION_API_KEY in env before starting; Forge app sends it as X-API-Key header
+API_KEY = os.environ.get('MIGRATION_API_KEY', 'demo-key-change-me')
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.headers.get('X-API-Key') != API_KEY:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ---------------------------------------------------------------------------
+# Job runner
+# ---------------------------------------------------------------------------
+
+# Timestamp prefix written by Python logging (e.g. "2026-08-10 07:15:53,295 - INFO - ")
+_TS_RE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ - \w+ - ')
+
+# Patterns for extracting live migration progress from log lines
+_PROG_PATTERNS = {
+    # Matches both filter mode "[main] Found 5 issues" and JQL mode "[main] JQL returned 5 issues"
+    'total':         re.compile(r'\[main\] (?:Found|JQL returned) (\d+) issues'),
+    'copying':       re.compile(r'\[main\] Copying ([\w-]+)'),
+    'finished':      re.compile(r'\[main\] Finished work item: (\d+)'),
+    'failed_proc':   re.compile(r'\[main\] Failed to process ([\w-]+): (.+)'),
+    'created_full':  re.compile(r'\[CREATE\] Created ADO item (\d+) for Jira ([\w-]+)'),
+    'updated_full':  re.compile(r'\[UPDATE\] Updating existing ADO item (\d+) for Jira ([\w-]+)'),
+    'dup_full':      re.compile(r'\[DUPLICATE PREVENTED\].*for ([\w-]+) -> (\d+)'),
+    'assign_fail':   re.compile(r'Could not assign .* in ADO for ([\w-]+)'),
+    'reporter_fail': re.compile(r'Could not set reporter .* in ADO for ([\w-]+)'),
+    # group(1)=total processed, group(2)=succeeded — use total for progress bar
+    'summary':       re.compile(r'(\d+) processed: (\d+) succeeded'),
+}
+
+# Which line prefixes to include in the live_log shown in the UI
+_LIVE_LOG_PREFIXES = (
+    '[main]', '[CREATE]', '[UPDATE]', '[DUPLICATE', '[bootstrap]',
+    '[board-detect]', '[board-setup]', '[summary]', '[gaps]', '[verify]',
+    'Copying ', '\u2705', '\u26a0\ufe0f', '\u274c', '==========',
+)
+
+
+def _categorize_error(rc: int, stdout_lines: list, error_lines: list) -> str:
+    """Return a short, user-facing message based on what actually went wrong."""
+    combined = ' '.join(error_lines + stdout_lines[-10:]).lower()
+
+    if 'filter' in combined and ('not found' in combined or '404' in combined or 'not accessible' in combined):
+        import re as _re
+        m = _re.search(r"filter[^'\"]*['\"]?(\d+)['\"]?", combined)
+        fid = m.group(1) if m else ''
+        return (f'Filter ID {fid} was not found.' if fid else 'Filter not found.') + \
+               ' Please double-check the number and make sure the filter is shared with your account in Jira.'
+
+    if any(x in combined for x in ('401', '403', 'unauthorized', 'forbidden', 'invalid token', 'authentication')):
+        return 'Access denied — your Jira API token or ADO token may be expired or incorrect. Please check your credentials.'
+
+    if any(x in combined for x in ('connection refused', 'timed out', 'could not connect', 'name or service not known')):
+        return 'Could not reach Jira or Azure DevOps. Please check your internet connection and try again.'
+
+    if rc == 0 and error_lines:
+        import re as _re
+        processed = next((_re.search(r'(\d+) processed', l) for l in stdout_lines if 'processed' in l), None)
+        if processed:
+            return f'Migration completed with some issues — {processed.group(0)}. Download the CSV report for a full breakdown.'
+        return 'Migration completed but some cards had issues. Download the CSV report for details.'
+
+    return 'Migration could not be started. Please verify the filter ID, check your credentials, and try again.'
+
+
+# Keep old name as alias so existing callers still work
+_summarise_errors = lambda lines: _categorize_error(0, [], lines)
+
+
+def _drain_pipe(pipe, buf: list, job_id: str, stream: str):
+    """Read pipe line-by-line, logging each line, updating rolling snapshot and progress."""
+    log_fn = logging.info if stream in ('OUT', 'LOG') else logging.warning
+    for raw in pipe:
+        line = raw.rstrip('\n')
+        log_fn(f"[{job_id}] {stream}: {line}")
+        buf.append(line)
+
+        # Skip timestamped versions to avoid double-processing (each line appears twice:
+        # once via Python logging with timestamp, once as a plain print without timestamp)
+        clean = _TS_RE.sub('', line).strip()
+        is_clean = bool(clean) and not _TS_RE.match(line)
+
+        with _jobs_lock:
+            key = 'output' if stream == 'OUT' else 'error'
+            _jobs[job_id][key] = '\n'.join(buf[-500:])
+
+            if not is_clean:
+                continue
+
+            prog = _jobs[job_id].setdefault('progress', {
+                'total': 0, 'done': 0,
+                'current_card': '', 'current_ado': '', 'current_action': '',
+            })
+            card_rep = _jobs[job_id].setdefault('card_report', {})
+
+            m = _PROG_PATTERNS['total'].search(clean)
+            if m:
+                prog['total'] = int(m.group(1))
+
+            m = _PROG_PATTERNS['copying'].search(clean)
+            if m:
+                jira_key = m.group(1)
+                prog['current_card'] = jira_key
+                prog['current_action'] = 'processing'
+                card_rep.setdefault(jira_key, {
+                    'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''
+                })
+
+            m = _PROG_PATTERNS['created_full'].search(clean)
+            if m:
+                ado_id, jira_key = m.group(1), m.group(2)
+                prog['current_ado'] = ado_id
+                prog['current_action'] = 'created'
+                card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                card_rep[jira_key].update({'ado_id': ado_id, 'action': 'created'})
+
+            m = _PROG_PATTERNS['updated_full'].search(clean)
+            if m:
+                ado_id, jira_key = m.group(1), m.group(2)
+                prog['current_ado'] = ado_id
+                prog['current_action'] = 'updated'
+                card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                card_rep[jira_key].update({'ado_id': ado_id, 'action': 'updated'})
+
+            m = _PROG_PATTERNS['dup_full'].search(clean)
+            if m:
+                jira_key, ado_id = m.group(1), m.group(2)
+                prog['current_ado'] = ado_id
+                prog['current_action'] = 'already in ADO'
+                card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                card_rep[jira_key].update({'ado_id': ado_id, 'action': 'existing'})
+
+            m = _PROG_PATTERNS['assign_fail'].search(clean)
+            if m:
+                jira_key = m.group(1)
+                card = card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                if 'Assigned To' not in card['field_issues']:
+                    card['field_issues'].append('Assigned To')
+
+            m = _PROG_PATTERNS['reporter_fail'].search(clean)
+            if m:
+                jira_key = m.group(1)
+                card = card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                if 'Reporter' not in card['field_issues']:
+                    card['field_issues'].append('Reporter')
+
+            m = _PROG_PATTERNS['failed_proc'].search(clean)
+            if m:
+                jira_key, err = m.group(1), m.group(2)
+                card = card_rep.setdefault(jira_key, {'ado_id': '', 'action': '', 'field_issues': [], 'status': 'in_progress', 'error': ''})
+                # If the card already has an ADO id it was created/updated before the
+                # post-processing crash — treat it as warning, not a full failure.
+                new_status = 'warning' if card.get('ado_id') else 'failed'
+                card.update({'status': new_status, 'error': err})
+                prog['done'] = prog.get('done', 0) + 1
+
+            m = _PROG_PATTERNS['finished'].search(clean)
+            if m:
+                fin_ado_id = m.group(1)
+                for k, v in card_rep.items():
+                    if v.get('ado_id') == fin_ado_id and v.get('status') == 'in_progress':
+                        v['status'] = 'warning' if v.get('field_issues') else 'success'
+                        break
+                prog['done'] = prog.get('done', 0) + 1
+
+            m = _PROG_PATTERNS['summary'].search(clean)
+            if m:
+                prog['done'] = int(m.group(1))  # total processed (success + failed)
+
+            if any(clean.startswith(p) for p in _LIVE_LOG_PREFIXES):
+                llog = _jobs[job_id].setdefault('live_log', [])
+                llog.append(clean)
+                _jobs[job_id]['live_log'] = llog[-20:]
+
+
+def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
+    """Run a script subprocess in a background thread with real-time line logging."""
+    with _jobs_lock:
+        _jobs[job_id].update({
+            'status': 'running', 'output': '', 'error': '',
+            'started_at': datetime.utcnow().isoformat() + 'Z',
+            'progress': {'total': 0, 'done': 0, 'current_card': '', 'current_ado': '', 'current_action': ''},
+            'live_log': [],
+            'card_report': {},
+            'card_csv': '',
+        })
+
+    logging.info(f"[{job_id}] START  cmd={' '.join(cmd)}")
+    logging.info(f"[{job_id}]        cwd={cwd}")
+
+    stdout_buf, stderr_buf = [], []
+    try:
+        proc_env = os.environ.copy()
+        if env_overrides:
+            proc_env.update(env_overrides)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, env=proc_env,
+        )
+        with _jobs_lock:
+            _jobs[job_id]['_proc'] = proc  # stored so /cancel can terminate it
+        # Drain both pipes concurrently to avoid buffer deadlocks
+        t_out = threading.Thread(target=_drain_pipe, args=(proc.stdout, stdout_buf, job_id, 'OUT'), daemon=True)
+        t_err = threading.Thread(target=_drain_pipe, args=(proc.stderr, stderr_buf, job_id, 'LOG'), daemon=True)
+        t_out.start()
+        t_err.start()
+        proc.wait()
+        t_out.join()
+        t_err.join()
+
+        rc = proc.returncode
+        # Worker scripts exit 0 even on application errors — detect logged ERROR lines
+        error_lines = [
+            l for l in stderr_buf
+            if ' - ERROR - ' in l or l.startswith('Error:') or l.startswith('Failed')
+        ]
+        has_app_errors = bool(error_lines)
+
+        # Three-way outcome: clean, warnings (exit-0 + ERROR lines), or failure
+        if rc != 0:
+            final_status = 'failed'
+        elif has_app_errors:
+            final_status = 'warning'   # item migrated but some fields couldn't be set
+        else:
+            final_status = 'completed'
+
+        if has_app_errors and rc == 0:
+            logging.warning(
+                f"[{job_id}] Marking as WARNING — script exited 0 but logged {len(error_lines)} ERROR line(s) in stderr"
+            )
+
+        # Run verify_migration.py on the migrated keys to get ground-truth CSV
+        import tempfile as _tempfile, subprocess as _sub
+        with _jobs_lock:
+            job_meta = _jobs[job_id]
+            card_report = job_meta.get('card_report', {})
+            jira_inst = job_meta.get('jira_instance', 'healthfinch')
+            ado_proj = job_meta.get('ado_project', 'Embedded Refills Engineering')
+            jira_filt = job_meta.get('jira_filter', '')
+            jira_ks = job_meta.get('jira_keys', '')
+
+        # Verify only keys that actually reached ADO (have an ado_id)
+        verify_keys = ','.join(k for k, v in card_report.items() if v.get('ado_id'))
+        card_csv_str = ''
+        if verify_keys:
+            try:
+                with _tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as _tmp:
+                    csv_path = _tmp.name
+                verify_cmd = [
+                    'python3', str(SCRIPTS_DIR / 'verify_migration.py'),
+                    '--jira-instance', jira_inst,
+                    '--ado-project', ado_proj,
+                    '--jira-keys', verify_keys,
+                    '--csv-output', csv_path,
+                ]
+                logging.info(f"[{job_id}] Running post-migration verify: {' '.join(verify_cmd)}")
+                vp = _sub.run(verify_cmd, capture_output=True, text=True, timeout=300,
+                              cwd=str(SCRIPTS_DIR.parent.parent))
+                if vp.returncode not in (0, 1):
+                    logging.warning(f"[{job_id}] verify exited {vp.returncode}: {vp.stderr[-500:]}")
+                import os as _os
+                if _os.path.exists(csv_path):
+                    with open(csv_path) as _f:
+                        card_csv_str = _f.read()
+                    _os.unlink(csv_path)
+                    logging.info(f"[{job_id}] Verify CSV ready ({len(card_csv_str)} bytes)")
+            except Exception as _e:
+                logging.warning(f"[{job_id}] Post-migration verify failed: {_e}")
+
+        # Trust the verify CSV as ground truth: only keep 'warning' if CSV shows real failures.
+        # Harmless fallbacks (assignee/reporter stored in description) don't count as failures.
+        if card_csv_str and final_status == 'warning':
+            import csv as _csv, io as _io
+            try:
+                _reader = _csv.DictReader(_io.StringIO(card_csv_str))
+                _has_real_failures = any(
+                    row.get('migration_status', '') in ('failed', 'warnings')
+                    for row in _reader
+                )
+                if not _has_real_failures:
+                    final_status = 'completed'
+                    logging.info(f"[{job_id}] Verify CSV shows all items verified — downgrading WARNING → completed")
+            except Exception:
+                pass  # keep original status if CSV parsing fails
+
+        with _jobs_lock:
+            _jobs[job_id].update({
+                'status': final_status,
+                'output': '\n'.join(stdout_buf)[-8000:],
+                # Store only the actionable error lines so the frontend can show them cleanly
+                'error': '\n'.join(error_lines) if error_lines else '\n'.join(stderr_buf)[-3000:],
+                # Strip timestamps and deduplicate for a clean one-liner shown in the UI
+                'error_summary': _categorize_error(rc, stdout_buf, error_lines),
+                'return_code': rc,
+                'finished_at': datetime.utcnow().isoformat() + 'Z',
+                'card_csv': card_csv_str,
+            })
+        logging.info(
+            f"[{job_id}] DONE   exit={rc}  status={final_status}  "
+            f"stdout_lines={len(stdout_buf)}  stderr_lines={len(stderr_buf)}  "
+            f"error_lines={len(error_lines)}"
+        )
+        if error_lines:
+            logging.warning(f"[{job_id}] ERRORS: {' | '.join(error_lines[-5:])}")
+    except Exception as exc:
+        with _jobs_lock:
+            _jobs[job_id].update({
+                'status': 'failed', 'error': str(exc),
+                'error_summary': _categorize_error(1, [], [str(exc)]),
+                'finished_at': datetime.utcnow().isoformat() + 'Z',
+            })
+        logging.error(f"[{job_id}] Exception: {exc}")
+
+
+def _spawn(cmd: list, extra_fields: dict = None, env_overrides: dict = None) -> str:
+    """Register a job, start its thread, return the job_id."""
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {'status': 'queued', 'command': ' '.join(cmd), **(extra_fields or {})}
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, cmd, str(REPO_ROOT), env_overrides),
+        daemon=True,
+    ).start()
+    return job_id
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route('/health', methods=['GET'])
+def health():
+    """No auth needed — lets Forge verify the server is reachable."""
+    return jsonify({
+        'status': 'ok',
+        'scripts_dir': str(SCRIPTS_DIR),
+        'reports_dir': str(REPORTS_DIR),
+        'jobs_tracked': len(_jobs),
+    })
+
+
+@app.route('/ado-boards', methods=['GET'])
+@require_api_key
+def ado_boards():
+    """
+    Return boards for a given ADO project.
+    Query param: ?project=<project name or id>
+    """
+    import requests as req
+
+    project = request.args.get('project', '').strip()
+    if not project:
+        return jsonify({'error': 'project query parameter is required'}), 400
+
+    ado_org = os.environ.get('ADO_ORG', '')
+    ado_pat = os.environ.get('ADO_PAT', '')
+
+    if not ado_org or not ado_pat:
+        config_path = REPO_ROOT / 'config' / 'ado_config.json'
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if not ado_org:
+                ado_org = config.get('organization') or config.get('organization_url', '').rstrip('/').split('/')[-1]
+            if not ado_pat:
+                ado_pat = config.get('access_token', '')
+
+    if not ado_org or not ado_pat:
+        return jsonify({'error': 'ADO_ORG and ADO_PAT must be set'}), 500
+
+    credentials = base64.b64encode(f':{ado_pat}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {credentials}',
+        'Content-Type': 'application/json',
+    }
+
+    # Fetch teams — each team in a project owns a Kanban board in ADO ("All team boards")
+    url = f'https://dev.azure.com/{ado_org}/_apis/projects/{project}/teams?api-version=7.0&$top=200&mine=false'
+    try:
+        resp = req.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        boards = [
+            {'id': t['id'], 'name': t['name']}
+            for t in data.get('value', [])
+        ]
+        return jsonify({'boards': boards})
+    except Exception as exc:
+        logging.error(f'ADO boards fetch failed for project "{project}": {exc}')
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/ado-projects', methods=['GET'])
+@require_api_key
+def ado_projects():
+    """
+    Return all Azure DevOps projects for the configured organisation.
+    Reads ADO_ORG and ADO_PAT from environment; falls back to config/ado_config.json.
+    """
+    import requests as req
+
+    ado_org = os.environ.get('ADO_ORG', '')
+    ado_pat = os.environ.get('ADO_PAT', '')
+
+    # Fall back to config file when env vars are absent
+    if not ado_org or not ado_pat:
+        config_path = REPO_ROOT / 'config' / 'ado_config.json'
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if not ado_org:
+                # config uses 'organization' key directly (not a full URL)
+                ado_org = config.get('organization') or config.get('organization_url', '').rstrip('/').split('/')[-1]
+            if not ado_pat:
+                ado_pat = config.get('access_token', '')
+
+    if not ado_org or not ado_pat:
+        return jsonify({'error': 'ADO_ORG and ADO_PAT must be set (env or config/ado_config.json)'}), 500
+
+    credentials = base64.b64encode(f':{ado_pat}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {credentials}',
+        'Content-Type': 'application/json',
+    }
+
+    url = f'https://dev.azure.com/{ado_org}/_apis/projects?api-version=7.0&$top=200'
+    try:
+        resp = req.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        projects = [
+            {'id': p['id'], 'name': p['name']}
+            for p in data.get('value', [])
+        ]
+        return jsonify({'projects': projects})
+    except Exception as exc:
+        logging.error(f'ADO projects fetch failed: {exc}')
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/preflight', methods=['GET'])
+@require_api_key
+def preflight():
+    """Check ADO write access and type-config compatibility before migration starts."""
+    import requests as req
+    from urllib.parse import quote
+    import sys
+    sys.path.insert(0, str(REPO_ROOT))
+    from utilities.utils_ado import check_type_config_compatibility
+
+    ado_project = request.args.get('ado_project', '').strip()
+    if not ado_project:
+        return jsonify({'ok': False, 'errors': ['ado_project parameter is required.']}), 400
+
+    ado_org = os.environ.get('ADO_ORG', '')
+    ado_pat = os.environ.get('ADO_PAT', '')
+    if not ado_org or not ado_pat:
+        config_path = REPO_ROOT / 'config' / 'ado_config.json'
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            if not ado_org:
+                ado_org = cfg.get('organization') or cfg.get('organization_url', '').rstrip('/').split('/')[-1]
+            if not ado_pat:
+                ado_pat = cfg.get('access_token', '')
+
+    if not ado_org or not ado_pat:
+        return jsonify({'ok': False, 'errors': ['ADO credentials not configured.']}), 500
+
+    auth = ('', ado_pat)
+    base = f'https://dev.azure.com/{ado_org}'
+
+    # Step 1: project exists?
+    try:
+        r = req.get(
+            f'{base}/_apis/projects/{quote(ado_project)}?api-version=7.0',
+            auth=auth, timeout=10
+        )
+        if r.status_code == 404:
+            return jsonify({'ok': False, 'errors': [f"ADO project '{ado_project}' was not found. Check the project name."]})
+        if r.status_code in (401, 403):
+            return jsonify({'ok': False, 'errors': ['ADO credentials are invalid or expired. Check your PAT.']})
+        r.raise_for_status()
+    except Exception as exc:
+        return jsonify({'ok': False, 'errors': [f'Could not reach Azure DevOps: {exc}']})
+
+    # Step 2: get available work item types
+    try:
+        r = req.get(
+            f'{base}/{quote(ado_project, safe="")}/_apis/wit/workitemtypes?api-version=7.0',
+            auth=auth, timeout=10
+        )
+        r.raise_for_status()
+        types = [t['name'] for t in r.json().get('value', [])]
+    except Exception as exc:
+        return jsonify({'ok': False, 'errors': [f"Could not read work item types for '{ado_project}': {exc}"]})
+
+    if not types:
+        return jsonify({'ok': False, 'errors': [f"No work item types found in '{ado_project}'."], 'ado_work_item_types': []})
+
+    # Step 3: test write permission with validateOnly=true (no side effects)
+    test_type = types[0]
+    try:
+        r = req.post(
+            f'{base}/{quote(ado_project, safe="")}/_apis/wit/workitems/${test_type}?api-version=7.0&validateOnly=true',
+            auth=auth,
+            headers={'Content-Type': 'application/json-patch+json'},
+            json=[{"op": "add", "path": "/fields/System.Title", "value": "__preflight__"}],
+            timeout=10
+        )
+        if r.status_code in (401, 403):
+            return jsonify({
+                'ok': False,
+                'errors': [f"You don't have permission to create work items in '{ado_project}'. Ask your ADO admin for Contributor access."],
+                'ado_work_item_types': types,
+            })
+        # 200 = valid; 400 = field validation errors = write access confirmed
+    except Exception as exc:
+        logging.warning(f'[preflight] validateOnly check failed (non-blocking): {exc}')
+
+    # Step 4: warn about any type-config mismatches (informational — migration still works via fallback)
+    type_config_path = REPO_ROOT / 'config' / 'type_config.json'
+    type_warnings = []
+    if type_config_path.exists():
+        try:
+            type_config = json.loads(type_config_path.read_text())
+            type_warnings = check_type_config_compatibility(type_config, types)
+        except Exception:
+            pass
+
+    return jsonify({
+        'ok': True,
+        'errors': [],
+        'ado_work_item_types': types,
+        'type_warnings': type_warnings,  # [{jira_type, configured, will_use}]
+    })
+
+
+@app.route('/explain-error', methods=['POST'])
+@require_api_key
+def explain_error():
+    """Return a plain-English explanation for a raw ADO error.
+
+    Checks ado_error_kb.json first. If no KB match and OPENAI_API_KEY is set,
+    falls back to an LLM for unknown errors. Degrades gracefully if neither matches.
+    """
+    data = request.json or {}
+    raw_error = data.get('error', '').strip()
+    context = data.get('context', {})  # {ado_project, jira_type, jira_key, available_types}
+
+    if not raw_error:
+        return jsonify({'explanation': '', 'action': '', 'who': '', 'source': 'none'}), 400
+
+    # Check knowledge base
+    kb_path = REPO_ROOT / 'config' / 'ado_error_kb.json'
+    kb = {}
+    if kb_path.exists():
+        try:
+            kb = json.loads(kb_path.read_text())
+        except Exception:
+            pass
+
+    for code, entry in kb.items():
+        if code in raw_error:
+            short = entry.get('short', raw_error)
+            action = entry.get('action', '')
+            who = entry.get('who', '')
+            # Interpolate {type} if present in the message
+            type_match = re.search(r"work item type '([^']+)'", raw_error, re.IGNORECASE)
+            type_name = type_match.group(1) if type_match else context.get('jira_type', 'unknown')
+            short = short.format(type=type_name) if '{type}' in short else short
+            action = action.format(type=type_name) if '{type}' in action else action
+            return jsonify({'explanation': short, 'action': action, 'who': who, 'source': 'kb', 'code': code})
+
+    # LLM fallback — only if OPENAI_API_KEY is configured
+    openai_key = os.environ.get('OPENAI_API_KEY', '')
+    if openai_key:
+        try:
+            import requests as req
+            prompt = (
+                f"You are an Azure DevOps migration assistant. Explain this error in plain English "
+                f"and give one actionable fix. Be concise (2-3 sentences max).\n\n"
+                f"Error: {raw_error}\n"
+                f"Context: migrating Jira type '{context.get('jira_type', '?')}' to ADO project "
+                f"'{context.get('ado_project', '?')}'. Available ADO types: {context.get('available_types', [])}."
+            )
+            resp = req.post(
+                'https://api.openai.com/v1/chat/completions',
+                headers={'Authorization': f'Bearer {openai_key}', 'Content-Type': 'application/json'},
+                json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 150},
+                timeout=10
+            )
+            resp.raise_for_status()
+            ai_text = resp.json()['choices'][0]['message']['content'].strip()
+            return jsonify({'explanation': ai_text, 'action': '', 'who': '', 'source': 'ai'})
+        except Exception as exc:
+            logging.warning(f'[explain-error] LLM call failed: {exc}')
+
+    # No match — return the raw error cleaned up
+    return jsonify({'explanation': raw_error, 'action': '', 'who': '', 'source': 'raw'})
+
+
+@app.route('/ping', methods=['GET'])
+@require_api_key
+def ping():
+    """
+    Connection check called by the Forge backend resolver when the user clicks
+    "Migrate to ADO". Returns a confirmation that the Python engine is reachable
+    and authenticated. The Forge UI shows this message in the modal.
+    """
+    return jsonify({
+        'status': 'ok',
+        'message': 'Connected to Python engine',
+        'scripts_available': [
+            'worker_jira_to_ado_copy.py',
+            'migration_gap_analysis.py',
+            'verify_migration.py',
+        ],
+    })
+
+
+@app.route('/migrate', methods=['POST'])
+@require_api_key
+def migrate():
+    """
+    Trigger a Jira → ADO migration job.
+
+    Request body (JSON):
+        jira_instance     str   Jira subdomain, e.g. "healthfinch"
+        ado_project       str   ADO project name
+        jira_filter       str   Jira filter ID  (provide this OR jira_keys OR jql)
+        jira_keys         str   Comma-separated Jira keys  (provide this OR jira_filter OR jql)
+        jql               str   JQL query passed as --jira-jql to worker (AI migrate flow, scalable)
+        skip_attachments  bool  Skip attachment upload (default: false)
+
+    Response 202:
+        { job_id, status: "queued" }
+    """
+    body = request.get_json(force=True) or {}
+
+    jira_instance = body.get('jira_instance', 'healthfinch')
+    ado_project = body.get('ado_project', '').strip() or 'Embedded Refills Engineering'
+    jira_filter = body.get('jira_filter', '').strip()
+    jira_keys = body.get('jira_keys', '').strip()
+    jql = body.get('jql', '').strip()
+    # Credentials forwarded from Forge KVS — override the worker's local jira_config.json
+    jira_url   = body.get('jira_url', '').strip()
+    jira_email = body.get('jira_email', '').strip()
+    jira_token = body.get('jira_token', '').strip()
+    # Derive the instance label from the actual URL so the command log is accurate
+    if jira_url:
+        from urllib.parse import urlparse as _urlparse
+        _host = _urlparse(jira_url).hostname or ''
+        if _host:
+            jira_instance = _host.split('.')[0]
+    skip_attachments = body.get('skip_attachments', False)
+
+    logging.info(f"MIGRATE request: jira_instance={jira_instance!r}  ado_project={ado_project!r}  "
+                 f"jira_filter={jira_filter!r}  jira_keys={jira_keys!r}  jql={jql!r}  "
+                 f"skip_attachments={skip_attachments}")
+    if jira_url:
+        logging.info(f"MIGRATE jira_url from Forge KVS: {jira_url}  (overrides --jira-instance {jira_instance!r})")
+
+    if not jira_filter and not jira_keys and not jql:
+        logging.warning("MIGRATE rejected: no jira_filter, jira_keys, or jql in request")
+        return jsonify({'error': 'Provide jira_filter, jira_keys, or jql'}), 400
+
+    cmd = [
+        'python3', str(SCRIPTS_DIR / 'worker_jira_to_ado_copy.py'),
+        '--jira-instance', jira_instance,
+        '--ado-project', ado_project,
+    ]
+    if jira_filter:
+        cmd += ['--jira-filter', jira_filter]
+    if jira_keys:
+        cmd += ['--jira-keys', jira_keys]
+    if jql:
+        # Pass JQL directly — worker paginates internally, no ARG_MAX risk
+        cmd += ['--jira-jql', jql]
+    if skip_attachments:
+        cmd.append('--skip-attachments')
+
+    logging.info(f"MIGRATE cmd: {' '.join(cmd)}")
+    # Pass Jira credentials as env vars so worker uses them instead of local jira_config.json
+    jira_env = {}
+    if jira_url and jira_email and jira_token:
+        jira_env = {'JIRA_URL': jira_url, 'JIRA_EMAIL': jira_email, 'JIRA_TOKEN': jira_token}
+
+    job_id = _spawn(cmd, extra_fields={
+        'jira_instance': jira_instance,
+        'ado_project': ado_project,
+        'jira_filter': jira_filter,
+        'jira_keys': jira_keys,
+        'jql': jql,
+    }, env_overrides=jira_env)
+    logging.info(f"MIGRATE queued as job_id={job_id}  jira_creds_overridden={bool(jira_env)}")
+    return jsonify({'job_id': job_id, 'status': 'queued'}), 202
+
+
+@app.route('/status/<job_id>', methods=['GET'])
+@require_api_key
+def job_status(job_id):
+    """
+    Poll a running or finished job.
+
+    Response fields:
+        status      "queued" | "running" | "completed" | "failed"
+        output      Last 8 000 chars of stdout
+        error       Last 3 000 chars of stderr
+        return_code int (present when finished)
+        started_at  ISO-8601
+        finished_at ISO-8601 (present when finished)
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    # Strip internal non-serializable fields before returning
+    safe = {k: v for k, v in job.items() if not k.startswith('_')}
+    safe['has_csv'] = bool(safe.get('card_csv', ''))
+    return jsonify(safe)
+
+
+@app.route('/cancel/<job_id>', methods=['POST'])
+@require_api_key
+def cancel_job(job_id):
+    """Terminate a running migration job immediately."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    status = job.get('status')
+    if status not in ('queued', 'running'):
+        return jsonify({'message': 'Job already finished', 'status': status}), 200
+
+    proc = job.get('_proc')
+    if proc:
+        try:
+            proc.terminate()
+            logging.info(f"[{job_id}] CANCELLED by user — sent SIGTERM to subprocess")
+        except Exception as e:
+            logging.warning(f"[{job_id}] terminate() failed: {e}")
+
+    with _jobs_lock:
+        _jobs[job_id].update({
+            'status': 'cancelled',
+            'error_summary': 'Migration was cancelled by the user.',
+            'finished_at': datetime.utcnow().isoformat() + 'Z',
+        })
+
+    return jsonify({'message': 'Migration cancelled', 'status': 'cancelled'}), 200
+
+
+@app.route('/csv/<job_id>', methods=['GET'])
+def job_csv(job_id):
+    """Return the per-card migration report CSV for a finished job.
+
+    Accepts auth via X-API-Key header OR ?key= query param (needed for browser download links).
+    """
+    key = request.headers.get('X-API-Key') or request.args.get('key', '')
+    if key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    csv_content = job.get('card_csv', '')
+    if not csv_content:
+        return jsonify({'error': 'No CSV report available yet'}), 404
+    return csv_content, 200, {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': f'attachment; filename="migration-report-{job_id[:8]}.csv"',
+    }
+
+
+@app.route('/gaps', methods=['POST'])
+@require_api_key
+def gaps():
+    """
+    Run gap analysis between a Jira filter and an ADO board.
+
+    Request body (JSON):
+        jira_instance  str
+        jira_filter    str   (required)
+        ado_board      str
+        ado_project    str
+
+    Response 202:
+        { job_id, status: "queued", report: "/absolute/path/to/gaps_<ts>.csv" }
+    """
+    body = request.get_json(force=True) or {}
+
+    jira_instance = body.get('jira_instance', 'healthfinch')
+    ado_project = body.get('ado_project', 'Embedded Refills Engineering')
+    jira_filter = body.get('jira_filter', '').strip()
+    ado_board = body.get('ado_board', '').strip()
+
+    if not jira_filter:
+        return jsonify({'error': 'jira_filter is required'}), 400
+
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    report_path = str(REPORTS_DIR / f'gaps_{ts}.csv')
+
+    cmd = [
+        'python3', str(SCRIPTS_DIR / 'migration_gap_analysis.py'),
+        '--jira-instance', jira_instance,
+        '--jira-filter', jira_filter,
+        '--ado-project', ado_project,
+        '--csv', report_path,
+    ]
+    if ado_board:
+        cmd += ['--ado-board', ado_board]
+
+    job_id = _spawn(cmd, extra_fields={'report': report_path})
+    return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
+
+
+@app.route('/verify', methods=['POST'])
+@require_api_key
+def verify():
+    """
+    Verify field-by-field accuracy of migrated cards.
+
+    Request body (JSON):
+        jira_instance  str
+        ado_project    str
+        project_key    str   Verify all cards in project  (provide this OR jira_keys)
+        jira_keys      str   Comma-separated keys to verify
+
+    Response 202:
+        { job_id, status: "queued", report: "/absolute/path/to/verify_<ts>.html" }
+    """
+    body = request.get_json(force=True) or {}
+
+    jira_instance = body.get('jira_instance', 'healthfinch')
+    ado_project = body.get('ado_project', 'Embedded Refills Engineering')
+    project_key = body.get('project_key', '').strip()
+    jira_keys = body.get('jira_keys', '').strip()
+    jira_filter = body.get('jira_filter', '').strip()
+
+    if not project_key and not jira_keys and not jira_filter:
+        return jsonify({'error': 'Provide project_key, jira_keys, or jira_filter'}), 400
+
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    report_path = str(REPORTS_DIR / f'verify_{ts}.html')
+
+    cmd = [
+        'python3', str(SCRIPTS_DIR / 'verify_migration.py'),
+        '--jira-instance', jira_instance,
+        '--ado-project', ado_project,
+        '--output', report_path,
+    ]
+    if project_key:
+        cmd += ['--project-key', project_key]
+    if jira_keys:
+        cmd += ['--jira-keys', jira_keys]
+    if jira_filter:
+        cmd += ['--jira-filter', jira_filter]
+
+    job_id = _spawn(cmd, extra_fields={'report': report_path})
+    return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
+
+
+# ---------------------------------------------------------------------------
+# Analysis  (Phase 1 — deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+@app.route('/analyze', methods=['POST'])
+@require_api_key
+def analyze():
+    """
+    POST /analyze
+    Body (JSON):
+        intent       — natural language or Jira filter ID or JQL
+        ado_project  — ADO project name (e.g. "Embedded Refills Engineering")
+        jira_url     — e.g. "https://acme.atlassian.net"
+        jira_email   — Jira account email
+        jira_token   — Jira API token
+        ado_org      — ADO organisation slug
+        ado_pat      — ADO personal access token
+
+    Response 200:
+        {total_issues, by_type, by_status, ado_available_types,
+         type_gaps, user_gaps, attachment_count, comment_count}
+    Response 400: missing required fields
+    Response 422: analysis error (e.g. filter not found, no issues)
+    """
+    import sys
+    sys.path.insert(0, str(REPO_ROOT))
+    from api.analysis_engine import run_analysis  # lazy import keeps startup fast
+
+    body = request.get_json(force=True) or {}
+
+    ado_project      = (body.get('ado_project') or '').strip()
+    jira_project_key = (body.get('jira_project_key') or '').strip()
+    status_filter    = body.get('status_filter') or []   # list of status name strings
+    field_filter     = body.get('field_filter') or []    # list of field name strings
+    jira_url         = (body.get('jira_url') or '').strip()
+    jira_email       = (body.get('jira_email') or '').strip()
+    jira_token       = (body.get('jira_token') or '').strip()
+    ado_org          = (body.get('ado_org') or '').strip()
+    ado_pat          = (body.get('ado_pat') or '').strip()
+
+    missing = [f for f, v in {
+        'ado_project': ado_project,
+        'jira_project_key': jira_project_key,
+        'jira_url': jira_url, 'jira_email': jira_email, 'jira_token': jira_token,
+        'ado_org': ado_org, 'ado_pat': ado_pat,
+    }.items() if not v]
+
+    if missing:
+        return jsonify({'error': f"Missing required fields: {', '.join(missing)}"}), 400
+
+    logging.info(
+        f"ANALYZE project={jira_project_key!r}  statuses={status_filter}  "
+        f"ado_project={ado_project!r}  ado_org={ado_org!r}"
+    )
+
+    result = run_analysis(
+        ado_project=ado_project,
+        jira_url=jira_url,
+        jira_email=jira_email,
+        jira_token=jira_token,
+        ado_org=ado_org,
+        ado_pat=ado_pat,
+        jira_project_key=jira_project_key,
+        status_filter=status_filter,
+        field_filter=field_filter,
+    )
+
+    if 'error' in result:
+        return jsonify(result), 422
+
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5001))
+    logging.info(f"Migration API server on :{port}")
+    logging.info(f"Scripts: {SCRIPTS_DIR}")
+    logging.info(f"API key env var MIGRATION_API_KEY={'set' if 'MIGRATION_API_KEY' in os.environ else 'NOT SET (using default)'}")
+    app.run(host='0.0.0.0', port=port, debug=False)

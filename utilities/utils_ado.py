@@ -14,6 +14,38 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def _load_error_kb() -> dict:
+    """Load ADO error knowledge base from config/ado_error_kb.json."""
+    kb_path = Path(__file__).parent.parent / 'config' / 'ado_error_kb.json'
+    try:
+        return json.loads(kb_path.read_text())
+    except Exception:
+        return {}
+
+def _friendly_ado_error(msg: str) -> str:
+    """Replace raw ADO error codes with plain-English explanations from the KB file."""
+    kb = _load_error_kb()
+    for code, entry in kb.items():
+        if code in msg:
+            text = entry.get('short', msg)
+            if '{type}' in text:
+                m = re.search(r"work item type '([^']+)'", msg, re.IGNORECASE)
+                type_name = m.group(1) if m else 'unknown'
+                text = text.format(type=type_name)
+            return text
+    return msg
+
+
+class WorkItemsSizeLimitExceeded(RuntimeError):
+    pass
+
+class WorkItemTypeDisabledError(RuntimeError):
+    """Raised when VS403074: the target work item type is disabled in this ADO project."""
+    def __init__(self, type_name: str):
+        self.type_name = type_name
+        super().__init__(f"Work item type '{type_name}' is disabled in this ADO project.")
+
+
 @dataclass
 class AzureDevOpsConfig:
     """Configuration for Azure DevOps connection"""
@@ -84,15 +116,24 @@ class AzureDevOpsClient:
             response.raise_for_status()
             
         except RequestException as e:
-            # Retry logic for handling 503 status code and other request exceptions.
             logging.error(f"[ado_api_call] Error: {response.status_code if response is not None else 'No response'} for url: {url}")
             logging.error(f"[ado_api_call] Error response: {response.text if response is not None else 'No response'}")
             if response is not None and response.status_code == 400 and 'VS402337' in response.text:
                 logging.error("[ado_api_call] Work item size limit exceeded")
                 raise WorkItemsSizeLimitExceeded()
-            else:
-                logging.error(f"[ado_api_call] Error: {e}")
-                raise e
+            # Extract the human-readable message from the ADO response body
+            if response is not None:
+                try:
+                    body = response.json()
+                    ado_msg = (body.get('message') or '').strip()
+                    if ado_msg:
+                        if 'VS403074' in ado_msg:
+                            m = re.search(r"work item type '([^']+)'", ado_msg, re.IGNORECASE)
+                            raise WorkItemTypeDisabledError(m.group(1) if m else 'unknown') from None
+                        raise RuntimeError(_friendly_ado_error(ado_msg)) from None
+                except (ValueError, AttributeError):
+                    pass
+            raise e
 
         try:
             return response.json()
@@ -108,6 +149,16 @@ class AzureDevOpsClient:
 
         logging.debug(f"[format_date] Formatted date: {date_string}")
         return date_string
+
+    def get_project_work_item_types(self) -> list[str]:
+        """Return the names of all enabled work item types in self.project."""
+        url = f'{self.organization_url}/{quote(self.project)}/_apis/wit/workitemtypes?api-version=7.0'
+        try:
+            resp = self.ado_api_call('GET', url)
+            return [t['name'] for t in resp.get('value', [])]
+        except Exception as e:
+            logging.warning(f"[get_project_work_item_types] Could not fetch types: {e}")
+            return []
 
     def get_item_info(self, item_id):
         # Retrieves all information about a specific work item
@@ -303,6 +354,24 @@ class AzureDevOpsClient:
         logging.debug(f"[update_field] Updated field: {field}")
 
         return response
+
+    def change_work_item_type(self, item_id: int, new_type: str) -> bool:
+        """Change work item type using bypassRules=true — required by ADO for type changes."""
+        url = (
+            f'{self.organization_url}/{self.project}'
+            f'/_apis/wit/workitems/{item_id}?bypassRules=true&api-version={self.api_version}'
+        )
+        payload = [{'op': 'add', 'path': '/fields/System.WorkItemType', 'value': new_type}]
+        try:
+            response = self.ado_api_call('PATCH', url, payload)
+            if response is not None:
+                logging.info(f"[change_work_item_type] ✅ {item_id} → '{new_type}'")
+                return True
+            logging.warning(f"[change_work_item_type] ❌ {item_id} → '{new_type}': API returned None")
+            return False
+        except Exception as exc:
+            logging.warning(f"[change_work_item_type] ❌ {item_id} → '{new_type}': {exc}")
+            return False
 
     def add_hyperlink(self, item_id, hyperlink, author = None, last_update = None):
         # Add a hyperlink to a work item
@@ -915,4 +984,55 @@ class AzureDevOpsClient:
         except Exception as e:
             logging.error(f"[ensure_jira_key_tag] Error adding jiraKey tag to {ado_id}: {e}")
             return False
+
+
+# ---------------------------------------------------------------------------
+# Type-config validation (used by the API preflight check, not the migration script)
+# ---------------------------------------------------------------------------
+
+# Semantic fallback chains: for each Jira type, preferred ADO equivalents in order.
+_TYPE_FALLBACKS: dict[str, list[str]] = {
+    'story':           ['User Story', 'Product Backlog Item', 'Requirement', 'Feature', 'Task'],
+    'improvement':     ['User Story', 'Product Backlog Item', 'Requirement', 'Feature', 'Task'],
+    'epic':            ['Epic', 'Feature', 'User Story', 'Product Backlog Item'],
+    'feature request': ['Feature', 'User Story', 'Product Backlog Item', 'Request', 'Task'],
+    'bug':             ['Bug', 'Defect', 'Issue', 'Task'],
+    'task':            ['Task', 'User Story', 'Product Backlog Item', 'Issue'],
+    'sub-task':        ['Task', 'Child Task', 'User Story'],
+    'subtask':         ['Task', 'Child Task', 'User Story'],
+    'new feature':     ['Feature', 'User Story', 'Product Backlog Item', 'Task'],
+    'support request': ['Issue', 'Task', 'User Story', 'Impediment'],
+    'triage':          ['Issue', 'Task', 'Impediment', 'User Story'],
+    'incident':        ['Issue', 'Bug', 'Task', 'Impediment'],
+    '__default__':     ['User Story', 'Product Backlog Item', 'Task', 'Issue', 'Feature'],
+}
+
+
+def closest_ado_type(jira_type: str, wanted_ado_type: str, available: list[str]) -> str:
+    """Return the best available ADO type for a Jira type given project-available types."""
+    available_lower = {t.lower(): t for t in available}
+    if wanted_ado_type.lower() in available_lower:
+        return available_lower[wanted_ado_type.lower()]
+    chain = _TYPE_FALLBACKS.get(jira_type.lower(), _TYPE_FALLBACKS['__default__'])
+    for candidate in chain:
+        if candidate.lower() in available_lower:
+            return available_lower[candidate.lower()]
+    return available[0]
+
+
+def check_type_config_compatibility(type_config: dict, available_types: list[str]) -> list[dict]:
+    """Compare type_config mappings against available ADO types.
+
+    Returns a list of remapping warnings: [{'jira_type', 'configured', 'will_use'}]
+    so the caller (preflight endpoint) can surface them to the user before migration.
+    """
+    available_lower = {t.lower(): t for t in available_types}
+    warnings = []
+    for jira_type, ado_type in type_config.items():
+        if jira_type == 'Jira Type':
+            continue
+        if ado_type.lower() not in available_lower:
+            best = closest_ado_type(jira_type, ado_type, available_types)
+            warnings.append({'jira_type': jira_type, 'configured': ado_type, 'will_use': best})
+    return warnings
 

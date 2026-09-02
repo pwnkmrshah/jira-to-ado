@@ -11,8 +11,8 @@
     "Triage": "Issue",
     "Incident": "Issue",
     "Incident Remediation": "Issue",
-    "Sub-task": "Task",
-    "Sub-Task": "Task",
-    "Subtask": "Task",
+    "Sub-task": "Issue",
+    "Sub-Task": "Issue",
+    "Subtask": "Issue",
     "New Feature": "Issue"
 }

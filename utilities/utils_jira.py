@@ -25,6 +25,14 @@ class JiraConfig:
 
 def load_jira_config(jira_instance: str = None) -> JiraConfig:
     """Load configuration from environment variables or user input"""
+    # Check env var overrides first — set by Flask when forwarding Forge KVS credentials
+    env_url   = os.environ.get('JIRA_URL', '').strip()
+    env_email = os.environ.get('JIRA_EMAIL', '').strip()
+    env_token = os.environ.get('JIRA_TOKEN', '').strip()
+    if env_url and env_email and env_token:
+        logging.info(f"[load_jira_config] Using JIRA_URL env override: {env_url}")
+        return JiraConfig(server=env_url, email=env_email, access_token=env_token)
+
     #config_path = "C:\\Users\\matt.baker\\CascadeProjects\\ADO-Automation\\Config\\jira_config.json" #os.path.expanduser('~\ado_config.json')
     config_path = Path(__file__).parent.parent / "config" / "jira_config.json"
 
@@ -104,6 +112,15 @@ class JiraClient:
             
         except Exception as e:
             logger.error(f"Unexpected error while retrieving filter {filter_id}: {str(e)}")
+            return None
+
+        # Guard: jira_api_call returns None on HTTP errors (e.g. 404 filter not found)
+        if response is None:
+            logger.error(
+                f"Filter {filter_id!r} not found or not accessible. "
+                "Check the filter ID exists and is shared with this API token's account."
+            )
+            return None
 
         # Get the filter results using the JQL
         jql = response['jql']
@@ -150,6 +167,43 @@ class JiraClient:
         except Exception as e:
             logger.error(f"Unexpected error while executing JQL '{jql}': {str(e)}")
             return None
+
+    def search_jql_paginated(self, jql: str) -> dict | None:
+        """Fetch ALL issues matching a JQL via POST /rest/api/3/search/jql with nextPageToken pagination.
+
+        Returns same shape as get_filter_items: {'issues': [{'id': ..., 'key': ...}, ...]}
+        Scalable to any number of issues — no ARG_MAX or maxResults cap.
+        """
+        url = f'{self.server}/rest/api/3/search/jql'
+        all_issues: list = []
+        page_token: str | None = None
+
+        while True:
+            body: dict = {'jql': jql, 'maxResults': 200, 'fields': ['key']}
+            if page_token:
+                body['nextPageToken'] = page_token
+            try:
+                response = requests.post(
+                    url,
+                    auth=(self.email, self.access_token),
+                    headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+                    json=body,
+                    timeout=30,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.error(f'[search_jql_paginated] POST failed: {exc}')
+                return None
+
+            data = response.json()
+            page_issues = data.get('issues', [])
+            all_issues.extend(page_issues)
+            page_token = data.get('nextPageToken')
+            if not page_token:
+                break
+
+        logger.info(f'[search_jql_paginated] JQL returned {len(all_issues)} issues total: {jql!r}')
+        return {'issues': all_issues, 'total': len(all_issues)}
 
     def get_users(self):
         # Get list of Jira users
