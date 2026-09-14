@@ -122,24 +122,9 @@ class JiraClient:
             )
             return None
 
-        # Get the filter results using the JQL
+        # Get ALL filter results via cursor-based pagination — no 1000-item cap.
         jql = response['jql']
-        url = f'{self.server}/rest/api/3/search/jql'
-        payload = {
-            'jql': jql,
-            'startAt': 0,
-            'maxResults': 1000,
-            'fields':'key'
-        }
-
-        try:
-            response = self.jira_api_call('GET', url, payload)
-            return response
-
-        except Exception as e:
-            logger.error(f"Unexpected error while executing JQL {jql}: {str(e)}")
-
-        return None
+        return self.search_jql_paginated(jql)
 
     def search_issues(self, jql):
         """Execute a JQL search and return matching issues.
@@ -248,4 +233,3 @@ class JiraClient:
             
         except Exception as e:
             logger.error(f"Unexpected error while retrieving html comments: {str(e)}")
-
