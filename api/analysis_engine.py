@@ -26,6 +26,14 @@ def _load_type_config() -> dict:
     except Exception:
         return {}
 
+
+def _load_state_config() -> dict:
+    try:
+        with open(_CONFIG_DIR / 'state_config.json') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 logger = logging.getLogger(__name__)
 
 # Max issues to fetch for analysis — enough for field/type discovery without
@@ -130,6 +138,31 @@ def _fetch_ado_work_item_types(ado_org: str, ado_project: str, ado_pat: str) -> 
     except Exception as exc:
         logger.error("[analysis] ADO work item types fetch failed: %s", exc)
         return []
+
+
+def _fetch_ado_states(ado_org: str, ado_project: str, ado_pat: str, work_item_types: list[str]) -> list[str]:
+    """Union of state names across a project's work item types (order preserved, deduped).
+
+    ADO states are scoped per work item type, so this samples a few of the project's
+    types (states are usually shared across a process template) and merges the names.
+    """
+    from urllib.parse import quote
+    seen: dict[str, None] = {}
+    for wit in work_item_types[:6]:
+        url = (
+            f"https://dev.azure.com/{ado_org}/{quote(ado_project, safe='')}/"
+            f"_apis/wit/workitemtypes/{quote(wit, safe='')}/states?api-version=7.0"
+        )
+        try:
+            r = requests.get(url, auth=("", ado_pat), timeout=12)
+            r.raise_for_status()
+            for s in r.json().get("value", []):
+                name = s.get("name")
+                if name and name not in seen:
+                    seen[name] = None
+        except Exception as exc:
+            logger.warning("[analysis] ADO states fetch failed for type %r: %s", wit, exc)
+    return list(seen.keys())
 
 
 def _fetch_ado_users(ado_org: str, ado_pat: str) -> set[str]:
@@ -316,6 +349,83 @@ def build_type_mappings(by_type: list[dict], ado_types: list[str], type_config: 
 
 
 # ---------------------------------------------------------------------------
+# State mapping engine (Jira status -> ADO state)
+# ---------------------------------------------------------------------------
+
+# (ado state keyword, jira status keywords that suggest it) — checked in order
+_STATE_KEYWORD_TABLE: list[tuple[str, list[str]]] = [
+    ("new",       ["backlog", "to do", "todo", "draft", "idea", "ready", "prioritiz", "approved", "refinement", "selected"]),
+    ("active",    ["progress", "development", "doing", "review", "design"]),
+    ("resolved",  ["resolved", "qa", "acceptance", "verify"]),
+    ("closed",    ["done", "deploy", "complete", "closed"]),
+    ("completed", ["done", "deploy", "complete", "closed"]),
+    ("removed",   ["won't", "wont", "shelved", "declined", "cancel", "reject", "remove"]),
+]
+
+
+def _guess_ado_state(jira_state: str, ado_lower_to_display: dict[str, str]) -> tuple[str, int, str] | None:
+    """Best-effort keyword guess when no config/exact match exists."""
+    jl = jira_state.lower()
+    for target_kw, jira_kws in _STATE_KEYWORD_TABLE:
+        if any(kw in jl for kw in jira_kws):
+            for ado_lower, ado_display in ado_lower_to_display.items():
+                if target_kw in ado_lower:
+                    return ado_display, 78, f'Keyword match — "{jira_state}" typically maps to a "{target_kw}"-style state'
+    return None
+
+
+def _map_single_state(jira_state: str, count: int, ado_states: list[str], state_config: dict | None = None) -> dict:
+    """Return the best ADO state mapping for one Jira status with confidence + reason."""
+    ado_lower_to_display = {s.lower(): s for s in ado_states}
+
+    # 1. state_config.json — authoritative project-specific mapping
+    if state_config:
+        mapped = state_config.get(jira_state) or state_config.get(jira_state.lower())
+        if mapped and mapped.lower() in ado_lower_to_display:
+            return {
+                "jira": jira_state, "count": count,
+                "ado": ado_lower_to_display[mapped.lower()],
+                "confidence": 100,
+                "reason": f"Configured mapping in state_config.json: {jira_state} → {mapped}",
+            }
+
+    # 2. Exact case-insensitive match
+    if jira_state.lower() in ado_lower_to_display:
+        return {
+            "jira": jira_state, "count": count,
+            "ado": ado_lower_to_display[jira_state.lower()],
+            "confidence": 97, "reason": "Exact name match",
+        }
+
+    # 3. Keyword-based semantic guess
+    guess = _guess_ado_state(jira_state, ado_lower_to_display)
+    if guess:
+        ado_display, confidence, reason = guess
+        return {"jira": jira_state, "count": count, "ado": ado_display, "confidence": confidence, "reason": reason}
+
+    # 4. Fallback — configured Default, else the most "New"-like state, else first available
+    default_mapped = state_config.get('Default') if state_config else None
+    if default_mapped and default_mapped.lower() in ado_lower_to_display:
+        fallback = ado_lower_to_display[default_mapped.lower()]
+    else:
+        fallback = next(
+            (ado_lower_to_display[k] for k in ("new", "to do", "proposed") if k in ado_lower_to_display),
+            ado_states[0] if ado_states else "New",
+        )
+    return {
+        "jira": jira_state, "count": count,
+        "ado": fallback,
+        "confidence": 55,
+        "reason": f'No direct ADO equivalent found for "{jira_state}". "{fallback}" used as fallback — review recommended.',
+    }
+
+
+def build_state_mappings(by_status: list[dict], ado_states: list[str], state_config: dict | None = None) -> list[dict]:
+    """Generate state mappings, preferring state_config.json over keyword heuristics."""
+    return [_map_single_state(s["name"], s["count"], ado_states, state_config) for s in by_status]
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -383,7 +493,9 @@ def run_analysis(
     # 4. Fetch ADO data (run both; they're independent)
     ado_types = _fetch_ado_work_item_types(ado_org, ado_project, ado_pat)
     ado_users = _fetch_ado_users(ado_org, ado_pat)
+    ado_states = _fetch_ado_states(ado_org, ado_project, ado_pat, ado_types)
     type_config = _load_type_config()
+    state_config = _load_state_config()
 
     # 5. Compute gaps
     ado_types_lower = {t.lower() for t in ado_types}
@@ -409,17 +521,20 @@ def run_analysis(
         {"name": t, "count": c}
         for t, c in sorted(type_counts.items(), key=lambda x: -x[1])
     ]
+    by_status_list = [
+        {"name": s, "count": c}
+        for s, c in sorted(status_counts.items(), key=lambda x: -x[1])
+    ]
 
     return {
         "total_issues": len(issues),
         "jql_used": jql,
         "by_type": by_type_list,
-        "by_status": [
-            {"name": s, "count": c}
-            for s, c in sorted(status_counts.items(), key=lambda x: -x[1])
-        ],
+        "by_status": by_status_list,
         "ado_available_types": ado_types,
         "type_mappings": build_type_mappings(by_type_list, ado_types, type_config),
+        "ado_available_states": ado_states,
+        "state_mappings": build_state_mappings(by_status_list, ado_states, state_config),
         "type_gaps": type_gaps,
         "user_gaps": user_gaps,
         "attachment_count": attachment_total,
