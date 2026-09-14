@@ -662,23 +662,28 @@ def main():
             jira_keys = sorted(mapping.keys())
             logging.info(f"Using ALL keys from mapping: {len(jira_keys)} keys")
         else:
-            # LAYER 1 FILTER: Get only keys from mapping starting with board prefix
-            jira_keys = sorted([k for k in mapping.keys() if k.startswith(prefix + '-')])
-            logging.info(f"Filtered mapping by prefix '{prefix}': {len(jira_keys)} keys")
-
-            if not jira_keys:
-                logging.error(f"No keys found for project '{args.project_key}' in mapping")
-                sys.exit(1)
-            
-            # FETCH ACTUAL JIRA KEYS for this project (for gap detection)
+            # Fetch keys LIVE from Jira first — this is the source of truth and doesn't
+            # depend on the local migration_mapping.json file being present (e.g. on Render,
+            # where that file is gitignored and never deployed).
             try:
                 jql = f'project = {prefix}'
-                resp = jira_client.search_issues(jql)
+                resp = jira_client.search_jql_paginated(jql)
                 jira_actual_keys = sorted([i['key'] for i in resp.get('issues', [])])
                 logging.info(f"Fetched from Jira project '{prefix}': {len(jira_actual_keys)} actual keys")
             except Exception as e:
                 logging.warning(f"Could not fetch actual Jira keys for project '{prefix}': {e}")
                 jira_actual_keys = None
+
+            if jira_actual_keys:
+                jira_keys = jira_actual_keys
+            else:
+                # Fall back to the local mapping file only if the live fetch failed entirely
+                jira_keys = sorted([k for k in mapping.keys() if k.startswith(prefix + '-')])
+                logging.info(f"Live fetch unavailable — filtered mapping by prefix '{prefix}': {len(jira_keys)} keys")
+
+            if not jira_keys:
+                logging.error(f"No keys found for project '{args.project_key}' (checked live Jira and local mapping)")
+                sys.exit(1)
     else:
         resp = jira_client.get_filter_items(args.jira_filter)
         jira_keys = [i['key'] for i in resp.get('issues', [])]

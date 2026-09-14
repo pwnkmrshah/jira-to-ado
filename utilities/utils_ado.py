@@ -58,10 +58,20 @@ class AzureDevOpsConfig:
 # If running from Azure Pipeline, use the SYSTEM_ACCESSTOKEN. don't call load_ado_config
 def load_ado_config() -> AzureDevOpsConfig:
     """Load configuration from environment variables or user input"""
-    #config_path = "C:\\Users\\matt.baker\\CascadeProjects\\ADO-Automation\\Config\\ado_config.json" #os.path.expanduser('~\ado_config.json')
+    # Env vars take priority — required on Render, where config/ado_config.json
+    # doesn't exist (it's gitignored and only present on local dev machines).
+    env_org = os.environ.get('ADO_ORG', '')
+    env_pat = os.environ.get('ADO_PAT', '')
+    if env_org and env_pat:
+        return AzureDevOpsConfig(
+            organization=env_org,
+            access_token=env_pat,
+            username=os.environ.get('ADO_USERNAME', ''),
+        )
+
     config_path = Path(__file__).parent.parent / "config" / "ado_config.json"
 
-    # Try to load from config file
+    # Fall back to config file
     if os.path.exists(config_path):
         try:
             with open(config_path, 'r') as f:
@@ -71,6 +81,11 @@ def load_ado_config() -> AzureDevOpsConfig:
 
         except Exception as e:
             logging.warning(f"[load_ado_config] Warning: Could not read config file: {e}")
+
+    raise RuntimeError(
+        "ADO credentials not found. Set ADO_ORG and ADO_PAT environment variables, "
+        "or provide config/ado_config.json."
+    )
 
 class AzureDevOpsClient:
     """Client for interacting with Azure DevOps"""
@@ -194,17 +209,21 @@ class AzureDevOpsClient:
                 'path': '/fields/System.Title',
                 'value': title
             },
-            {
-                'op': 'add',
-                'path': '/fields/System.Description',
-                'value': description
-            },
-            {
-                'op': 'add',
-                'path': '/multilineFieldsFormat/System.Description',
-                'value': 'Markdown'
-            }
         ]
+        # ADO rejects null values; omit the field entirely when no description is supplied
+        if description is not None:
+            payload += [
+                {
+                    'op': 'add',
+                    'path': '/fields/System.Description',
+                    'value': description or '',
+                },
+                {
+                    'op': 'add',
+                    'path': '/multilineFieldsFormat/System.Description',
+                    'value': 'Markdown',
+                },
+            ]
 
         if assigned_to:
             assigned_to_string = {
@@ -238,7 +257,15 @@ class AzureDevOpsClient:
             }
         ]
         logging.debug(f"[create_item] Setting state to: {state}")
-        response = self.ado_api_call('PATCH', url, payload)
+        try:
+            response = self.ado_api_call('PATCH', url, payload)
+        except RuntimeError as e:
+            if 'State' in str(e) and 'not in the list of supported values' in str(e):
+                logging.warning(f"[create_item] State '{state}' not valid for this work item type — falling back to 'Active'")
+                payload[0]['value'] = 'Active'
+                response = self.ado_api_call('PATCH', url, payload)
+            else:
+                raise
 
         return response
 
@@ -913,12 +940,26 @@ class AzureDevOpsClient:
             f'?api-version={self.api_version}'
         )
         payload = [
-            {'op': 'add', 'path': '/fields/System.Title',       'value': title},
-            {'op': 'add', 'path': '/fields/System.Description', 'value': description},
-            {'op': 'add', 'path': '/fields/System.State',       'value': state},
+            {'op': 'add', 'path': '/fields/System.Title', 'value': title},
+            {'op': 'add', 'path': '/fields/System.State', 'value': state},
         ]
+        # Omit description entirely when None (ADO rejects null values)
+        if description is not None:
+            payload += [
+                {'op': 'add', 'path': '/fields/System.Description', 'value': description or ''},
+                {'op': 'add', 'path': '/multilineFieldsFormat/System.Description', 'value': 'Markdown'},
+            ]
         logging.debug(f"[update_item_core_fields] Updating core fields on {ado_id}")
-        return self.ado_api_call('PATCH', url, payload)
+        try:
+            return self.ado_api_call('PATCH', url, payload)
+        except RuntimeError as e:
+            if 'State' in str(e) and 'not in the list of supported values' in str(e):
+                logging.warning(f"[update_item_core_fields] State '{state}' not valid for this work item type — falling back to 'Active'")
+                for op in payload:
+                    if op.get('path') == '/fields/System.State':
+                        op['value'] = 'Active'
+                return self.ado_api_call('PATCH', url, payload)
+            raise
 
     def add_work_item_link(self, item_id: int, target_ado_id: int, relation_type: str):
         """Create a real ADO work item relationship (parent/child, blocks, related, etc.).
@@ -1035,4 +1076,3 @@ def check_type_config_compatibility(type_config: dict, available_types: list[str
             best = closest_ado_type(jira_type, ado_type, available_types)
             warnings.append({'jira_type': jira_type, 'configured': ado_type, 'will_use': best})
     return warnings
-

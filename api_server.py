@@ -115,7 +115,7 @@ def _categorize_error(rc: int, stdout_lines: list, error_lines: list) -> str:
             return f'Migration completed with some issues — {processed.group(0)}. Download the CSV report for a full breakdown.'
         return 'Migration completed but some cards had issues. Download the CSV report for details.'
 
-    return 'Migration could not be started. Please verify the filter ID, check your credentials, and try again.'
+    return 'The operation could not be started. Please verify the filter ID / project key / board, check your credentials, and try again.'
 
 
 # Keep old name as alias so existing callers still work
@@ -310,7 +310,7 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
                 ]
                 logging.info(f"[{job_id}] Running post-migration verify: {' '.join(verify_cmd)}")
                 vp = _sub.run(verify_cmd, capture_output=True, text=True, timeout=300,
-                              cwd=str(SCRIPTS_DIR.parent.parent))
+                              cwd=str(SCRIPTS_DIR.parent.parent), env=proc_env)
                 if vp.returncode not in (0, 1):
                     logging.warning(f"[{job_id}] verify exited {vp.returncode}: {vp.stderr[-500:]}")
                 import os as _os
@@ -321,6 +321,20 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
                     logging.info(f"[{job_id}] Verify CSV ready ({len(card_csv_str)} bytes)")
             except Exception as _e:
                 logging.warning(f"[{job_id}] Post-migration verify failed: {_e}")
+
+        # Build a fallback CSV for any items that never reached ADO (failed before creation)
+        import csv as _csv_mod, io as _io_mod
+        failed_items = {k: v for k, v in card_report.items() if not v.get('ado_id')}
+        if failed_items:
+            _buf = _io_mod.StringIO()
+            _w = _csv_mod.writer(_buf)
+            if not card_csv_str:
+                _w.writerow(['jira_key', 'ado_id', 'migration_status', 'failed_checks', 'details'])
+            for jira_key, info in failed_items.items():
+                _w.writerow([jira_key, '', 'failed', 'creation', info.get('error', 'Item was not created in ADO')])
+            extra = _buf.getvalue()
+            card_csv_str = (card_csv_str.rstrip('\n') + '\n' + extra.strip('\n')).strip() if card_csv_str else extra
+            logging.info(f"[{job_id}] Appended {len(failed_items)} failed item(s) to CSV")
 
         # Trust the verify CSV as ground truth: only keep 'warning' if CSV shows real failures.
         # Harmless fallbacks (assignee/reporter stored in description) don't count as failures.
@@ -378,6 +392,20 @@ def _spawn(cmd: list, extra_fields: dict = None, env_overrides: dict = None) -> 
         daemon=True,
     ).start()
     return job_id
+
+
+def _jira_env_from_body(body: dict) -> dict:
+    """Build JIRA_URL/JIRA_EMAIL/JIRA_TOKEN env overrides from Forge-forwarded credentials.
+
+    Without this, subprocesses fall back to config/jira_config.json, which is
+    gitignored and doesn't exist on Render — causing load_jira_config() to return None.
+    """
+    jira_url = (body.get('jira_url') or '').strip()
+    jira_email = (body.get('jira_email') or '').strip()
+    jira_token = (body.get('jira_token') or '').strip()
+    if jira_url and jira_email and jira_token:
+        return {'JIRA_URL': jira_url, 'JIRA_EMAIL': jira_email, 'JIRA_TOKEN': jira_token}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +724,8 @@ def migrate():
     jira_filter = body.get('jira_filter', '').strip()
     jira_keys = body.get('jira_keys', '').strip()
     jql = body.get('jql', '').strip()
+    field_filter = [f.strip() for f in (body.get('field_filter') or []) if f.strip()]
+    ado_team_name = body.get('ado_team_name', '').strip()
     # Credentials forwarded from Forge KVS — override the worker's local jira_config.json
     jira_url   = body.get('jira_url', '').strip()
     jira_email = body.get('jira_email', '').strip()
@@ -710,7 +740,7 @@ def migrate():
 
     logging.info(f"MIGRATE request: jira_instance={jira_instance!r}  ado_project={ado_project!r}  "
                  f"jira_filter={jira_filter!r}  jira_keys={jira_keys!r}  jql={jql!r}  "
-                 f"skip_attachments={skip_attachments}")
+                 f"skip_attachments={skip_attachments}  field_filter={field_filter}")
     if jira_url:
         logging.info(f"MIGRATE jira_url from Forge KVS: {jira_url}  (overrides --jira-instance {jira_instance!r})")
 
@@ -732,6 +762,10 @@ def migrate():
         cmd += ['--jira-jql', jql]
     if skip_attachments:
         cmd.append('--skip-attachments')
+    if field_filter:
+        cmd += ['--field-filter', ','.join(field_filter)]
+    if ado_team_name:
+        cmd += ['--ado-team-name', ado_team_name]
 
     logging.info(f"MIGRATE cmd: {' '.join(cmd)}")
     # Pass Jira credentials as env vars so worker uses them instead of local jira_config.json
@@ -848,6 +882,7 @@ def gaps():
     ado_project = body.get('ado_project', 'Embedded Refills Engineering')
     jira_filter = body.get('jira_filter', '').strip()
     ado_board = body.get('ado_board', '').strip()
+    jira_env = _jira_env_from_body(body)
 
     if not jira_filter:
         return jsonify({'error': 'jira_filter is required'}), 400
@@ -865,7 +900,52 @@ def gaps():
     if ado_board:
         cmd += ['--ado-board', ado_board]
 
-    job_id = _spawn(cmd, extra_fields={'report': report_path})
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
+    return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
+
+
+@app.route('/gaps-board', methods=['POST'])
+@require_api_key
+def gaps_board():
+    """
+    Run gap analysis for an ENTIRE Jira board (project key) vs an ADO board —
+    no Jira filter ID required. Uses migration_gap_analysis_board.py, a separate
+    copy of migration_gap_analysis.py so the existing filter-based flow is untouched.
+
+    Request body (JSON):
+        jira_instance    str
+        jira_board_key   str   (required) Jira project key, e.g. "OP"
+        ado_board        str
+        ado_project      str
+
+    Response 202:
+        { job_id, status: "queued", report: "/absolute/path/to/gaps_board_<ts>.csv" }
+    """
+    body = request.get_json(force=True) or {}
+
+    jira_instance = body.get('jira_instance', 'healthfinch')
+    ado_project = body.get('ado_project', 'Embedded Refills Engineering')
+    jira_board_key = body.get('jira_board_key', '').strip()
+    ado_board = body.get('ado_board', '').strip()
+    jira_env = _jira_env_from_body(body)
+
+    if not jira_board_key:
+        return jsonify({'error': 'jira_board_key is required'}), 400
+
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    report_path = str(REPORTS_DIR / f'gaps_board_{ts}.csv')
+
+    cmd = [
+        'python3', str(SCRIPTS_DIR / 'migration_gap_analysis_board.py'),
+        '--jira-instance', jira_instance,
+        '--jira-board-key', jira_board_key,
+        '--ado-project', ado_project,
+        '--csv', report_path,
+    ]
+    if ado_board:
+        cmd += ['--ado-board', ado_board]
+
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 
@@ -891,6 +971,7 @@ def verify():
     project_key = body.get('project_key', '').strip()
     jira_keys = body.get('jira_keys', '').strip()
     jira_filter = body.get('jira_filter', '').strip()
+    jira_env = _jira_env_from_body(body)
 
     if not project_key and not jira_keys and not jira_filter:
         return jsonify({'error': 'Provide project_key, jira_keys, or jira_filter'}), 400
@@ -911,7 +992,7 @@ def verify():
     if jira_filter:
         cmd += ['--jira-filter', jira_filter]
 
-    job_id = _spawn(cmd, extra_fields={'report': report_path})
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 
