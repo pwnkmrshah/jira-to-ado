@@ -110,7 +110,13 @@ def load_config(filename):
 # ---------------------------------------------------------------------------
 
 def fetch_ado_item(ado_client, ado_id):
-    """Fetch ADO work item with detailed error logging."""
+    """Fetch ADO work item with detailed error logging.
+
+    ADO work item IDs are unique organization-wide, not per-project — the
+    GET-by-ID API call has no project scoping at all. Without an explicit
+    check here, a stale/cross-project ID in the local mapping file would
+    silently "verify" against the wrong ADO project.
+    """
     if not ado_id:
         logging.warning(f"[fetch_ado_item] No ADO ID provided")
         return None
@@ -129,6 +135,16 @@ def fetch_ado_item(ado_client, ado_id):
         if not isinstance(item, dict) or 'id' not in item:
             response_str = str(item)[:200] if isinstance(item, (dict, str)) else f"{type(item)}"
             logging.error(f"[fetch_ado_item] ADO {ado_id}: Invalid response structure. Response: {response_str}")
+            return None
+
+        # Reject items that belong to a different ADO project — the ID space
+        # is org-wide, so a match here does NOT imply it's in the right project.
+        item_project = (item.get('fields', {}) or {}).get('System.TeamProject', '')
+        if ado_client.project and item_project and item_project != ado_client.project:
+            logging.error(
+                f"[fetch_ado_item] ADO {ado_id}: belongs to project '{item_project}', "
+                f"not the requested '{ado_client.project}' — treating as not found."
+            )
             return None
         
         logging.debug(f"[fetch_ado_item] ADO {ado_id}: ✓ Successfully fetched work item (fields: {len(item)} keys)")
