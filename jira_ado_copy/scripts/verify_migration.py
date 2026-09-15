@@ -801,16 +801,16 @@ def main():
     if missing_in_ado:
         print(f"Missing in ADO:             {len(missing_in_ado)}")
         print("=" * 60)
-        print(f"\n❌ MISSING ITEMS FOUND! These Jira items are NOT in the migration mapping.\n")
+        print(f"\n⚠️  MISSING ITEMS FOUND — these Jira items are not yet migrated to ADO.\n")
         print(f"Missing {len(missing_in_ado)} item(s):")
-        
+
         # Show missing items in groups of 20
         for i, key in enumerate(missing_in_ado, 1):
             print(f"  {i:3d}. {key}")
             if i >= 20 and i < len(missing_in_ado):
                 print(f"  ... and {len(missing_in_ado) - 20} more")
                 break
-        
+
         # Log to file
         logging.info(f"\n\nMISSING ITEMS REPORT (Not in migration mapping)")
         logging.info(f"=" * 60)
@@ -819,17 +819,16 @@ def main():
         logging.info(f"Missing: {len(missing_in_ado)}")
         logging.info(f"Missing items: {', '.join(missing_in_ado)}")
         logging.info("=" * 60)
-        
+
         print(f"\n📝 Detailed log: {LOG_FILE}\n")
-        sys.exit(1)  # Exit with error code
-    
-    print(f"Missing in ADO:             0 ✅")
-    print("=" * 60)
-    print(f"\n✅ Card counts match! Proceeding with detailed verification...\n")
-    
-    print(f"Missing in ADO:            0 ✅")
-    print("=" * 60)
-    print(f"\n✅ Card counts match! Proceeding with detailed verification...\n")
+        # Continue rather than aborting — missing items are a valid verification
+        # finding, not a script failure. The report below still verifies every
+        # card that WAS migrated, and missing items are already listed above.
+        print(f"\nℹ️  Continuing verification for the {ado_count} item(s) already migrated...\n")
+    else:
+        print(f"Missing in ADO:             0 ✅")
+        print("=" * 60)
+        print(f"\n✅ Card counts match! Proceeding with detailed verification...\n")
 
     # Verify tickets
     results = []
