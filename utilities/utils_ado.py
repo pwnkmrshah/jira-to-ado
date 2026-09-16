@@ -862,6 +862,79 @@ class AzureDevOpsClient:
             logging.warning(f"[configure_team_area] Error for team '{team_name}': {e}")
             return False
 
+    def ensure_team_iteration_node(self, team_name: str) -> str | None:
+        """Create a dedicated child iteration node for *team_name* (if missing), and
+        add it to the team's SELECTED iterations (_apis/work/teamsettings/iterations).
+
+        configure_team_iteration() alone only sets 'backlogIteration' (a broad filter
+        for the Backlog page) — it does NOT add anything to the team's selected
+        iterations. Without a selected iteration, the Kanban BOARD stays empty even
+        when items exist under the correct AreaPath, because Boards require each
+        item's IterationPath to match one of the team's explicitly selected iterations.
+
+        Returns the full iteration path (e.g. "<Project>\\<team_name>") to assign on
+        each migrated work item's System.IterationPath, or None on failure.
+        """
+        import requests as _req, json as _json
+        auth = (self.username, self.access_token)
+        headers = {'Content-Type': 'application/json'}
+
+        # Step 1: does a child iteration named <team_name> already exist under root?
+        try:
+            tree_resp = _req.get(
+                f'{self.organization_url}/{self.project}'
+                f'/_apis/wit/classificationnodes/iterations?$depth=1&api-version=7.0',
+                auth=auth, headers=headers
+            )
+            if not tree_resp.ok:
+                logging.warning(f"[ensure_team_iteration_node] Could not fetch iteration tree")
+                return None
+            tree = tree_resp.json()
+            existing = next((c for c in (tree.get('children') or []) if c.get('name') == team_name), None)
+            if existing:
+                node_guid = existing.get('identifier')
+            else:
+                create_resp = _req.post(
+                    f'{self.organization_url}/{self.project}'
+                    f'/_apis/wit/classificationnodes/iterations?api-version=7.0',
+                    auth=auth, headers=headers,
+                    data=_json.dumps({'name': team_name})
+                )
+                if not create_resp.ok:
+                    logging.warning(
+                        f"[ensure_team_iteration_node] Could not create iteration '{team_name}': "
+                        f"{create_resp.status_code} {create_resp.text[:200]}"
+                    )
+                    return None
+                node_guid = create_resp.json().get('identifier')
+        except Exception as e:
+            logging.warning(f"[ensure_team_iteration_node] Error resolving iteration node: {e}")
+            return None
+
+        if not node_guid:
+            return None
+
+        # Step 2: add it to the team's selected iterations (idempotent — a 404/409 on
+        # "already selected" is expected and harmless on repeat runs)
+        try:
+            add_resp = _req.post(
+                f'{self.organization_url}/{self.project}/{team_name}'
+                f'/_apis/work/teamsettings/iterations?api-version=7.0',
+                auth=auth, headers=headers,
+                data=_json.dumps({'id': node_guid})
+            )
+            if not add_resp.ok and 'already' not in add_resp.text.lower():
+                logging.warning(
+                    f"[ensure_team_iteration_node] Could not add iteration to team '{team_name}': "
+                    f"{add_resp.status_code} {add_resp.text[:200]}"
+                )
+        except Exception as e:
+            logging.warning(f"[ensure_team_iteration_node] Error adding iteration to team: {e}")
+
+        iteration_path = f'{self.project}\\{team_name}'
+        logging.info(f"[ensure_team_iteration_node] Team '{team_name}' iteration ready: '{iteration_path}'")
+        return iteration_path
+
     def configure_team_iteration(self, team_name: str) -> bool:
         """Set the backlog iteration for *team_name* to the project root iteration.
 

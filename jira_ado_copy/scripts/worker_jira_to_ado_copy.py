@@ -141,6 +141,42 @@ JIRA_TO_ADO_LINK_TYPES = {
 # Cache: tracks project names already set up this run so we only call
 # ensure_area_path / ensure_team / configure_team_area once per project.
 _BOARD_SETUP_DONE: set = set()
+# Cache: team_name -> full iteration path (e.g. "<Project>\\<team_name>"), set once
+# per team so migrated items' System.IterationPath can be set to a value the team
+# actually has SELECTED (required for the Kanban Board to show them at all).
+_TEAM_ITERATION_PATH: dict = {}
+
+
+def _ensure_board_preflight(ado_client, team_name: str) -> bool:
+    """Create the ADO team/board for *team_name* before any cards are migrated.
+
+    Returns True if the board is ready (existed or was created), False on failure.
+    Called once per detected team at the top of main() before the migration loop.
+    """
+    if not team_name or team_name in _BOARD_SETUP_DONE:
+        return True
+    ado_project = ado_client.project
+    area_path   = f'{ado_project}\\{team_name}'
+    print(f'[pre-flight] Checking ADO board/team "{team_name}"…')
+    team_exists = ado_client.ensure_team(team_name)
+    if team_exists:
+        print(f'[pre-flight] Team "{team_name}" already exists — reusing.')
+    ok_area = ado_client.ensure_area_path(team_name)
+    ok_cfg  = ado_client.configure_team_area(team_name, area_path)
+    ok_iter = ado_client.configure_team_iteration(team_name)
+    iter_path = ado_client.ensure_team_iteration_node(team_name)
+    if iter_path:
+        _TEAM_ITERATION_PATH[team_name] = iter_path
+    _BOARD_SETUP_DONE.add(team_name)
+    if ok_area and ok_cfg:
+        org   = ado_client.organization_url.rstrip('/').split('/')[-1]
+        eproj = ado_project.replace(' ', '%20')
+        eteam = team_name.replace(' ', '%20')
+        print(f'[pre-flight] \u2705 ADO board ready: '
+              f'https://dev.azure.com/{org}/{eproj}/_boards/board/t/{eteam}/')
+        return True
+    print(f'[pre-flight] \u26a0\ufe0f  Board setup incomplete for "{team_name}" — migration will still proceed')
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +252,13 @@ def build_parsed_fields(jira_ticket: dict, type_config: dict, state_config: dict
         title = f'[{parent_key}] [{jira_key}] {jira_ticket["fields"]["summary"]}'
     else:
         title = f'[{jira_key}] {jira_ticket["fields"]["summary"]}'
+
+    # ADO rejects titles over 255 chars; truncate and keep full text for description.
+    _ADO_TITLE_MAX = 255
+    full_title = title
+    if len(title) > _ADO_TITLE_MAX:
+        title = title[:_ADO_TITLE_MAX - 1] + '…'
+        logging.warning(f"[title] {jira_key}: title truncated to {_ADO_TITLE_MAX} chars (was {len(full_title)})")
 
     assignee_field = jira_ticket['fields'].get('assignee') or {}
     assignee_email = assignee_field.get('emailAddress', '')
@@ -556,7 +599,8 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
                                 mapping: dict, type_config: dict,
                                 state_config: dict, custom_fields: list,
                                 force_create: bool = False, detected_team_name: str = None,
-                                skip_attachments: bool = False) -> int:
+                                skip_attachments: bool = False,
+                                fields_to_migrate: set | None = None) -> int:
     """Find an existing ADO work item for the Jira ticket or create a new one,
     then sync all fields, comments, attachments, and links.
 
@@ -574,6 +618,10 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     jira_key = jira_ticket['key']
     jira_id  = jira_ticket['id']
 
+    # None = all fields; a set limits which optional fields are written
+    def _want(field_id: str) -> bool:
+        return fields_to_migrate is None or field_id in fields_to_migrate
+
     # Note: Parent validation has been removed. Items are now created even if parent
     # is missing. The sync_links function will add parent links where possible and
     # fall back to Jira URL hyperlinks for missing parents.
@@ -581,13 +629,15 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     title, assignee, ado_type, ado_state, description = build_parsed_fields(
         jira_ticket, type_config, state_config
     )
+    # Only write description body if the user selected the description field
+    desc_to_write = description if _want('description') else None
 
     # ---- Find or create ----
     ado_id = None if force_create else find_existing_ado_work_item(jira_key, ado_client, mapping)
 
     if ado_id:
         logging.info(f"[UPDATE] Updating existing ADO item {ado_id} for Jira {jira_key}")
-        ado_client.update_item_core_fields(ado_id, title, ado_state, None, description)
+        ado_client.update_item_core_fields(ado_id, title, ado_state, None, desc_to_write)
         # Always enforce the correct type — bypassRules=true required; idempotent if already correct
         try:
             ado_client.change_work_item_type(ado_id, ado_type)
@@ -600,7 +650,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         used_type = ado_type
         for candidate_type in tried_types:
             try:
-                work_item = ado_client.create_item(candidate_type, None, title, ado_state, None, description)
+                work_item = ado_client.create_item(candidate_type, None, title, ado_state, None, desc_to_write)
                 used_type = candidate_type
                 break
             except WorkItemTypeDisabledError as exc:
@@ -639,6 +689,9 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             ok_area = ado_client.ensure_area_path(_ap_team)
             ok_cfg  = ado_client.configure_team_area(_ap_team, _ap_path)
             ok_iter = ado_client.configure_team_iteration(_ap_team)
+            _iter_path = ado_client.ensure_team_iteration_node(_ap_team)
+            if _iter_path:
+                _TEAM_ITERATION_PATH[_ap_team] = _iter_path
             if ok_area and ok_cfg and ok_iter:
                 org_name = ado_client.organization_url.rstrip('/').split('/')[-1]
                 print(f'[board-setup] \u2705 Team "{_ap_team}" ready — '
@@ -660,12 +713,23 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
                 else:
                     logging.warning(f"[area-path] \u274c Could not set '{_ap_path}' for {jira_key} after 3 attempts: {_e}")
 
+        # Iteration path — without this, items exist under the correct AreaPath
+        # but never appear on the team's Kanban Board (Boards require IterationPath
+        # to match one of the team's explicitly SELECTED iterations).
+        _iter_path = _TEAM_ITERATION_PATH.get(_ap_team)
+        if _iter_path:
+            try:
+                ado_client.update_field(ado_id, '/fields/System.IterationPath', _iter_path)
+                logging.info(f"[iteration-path] \u2705 {jira_key} → '{_iter_path}'")
+            except Exception as _e:
+                logging.warning(f"[iteration-path] \u274c Could not set '{_iter_path}' for {jira_key}: {_e}")
+
     # ---- Assignee: set System.AssignedTo in ADO when possible ----
     # Try email first (exact match), then display name (ADO fuzzy resolve).
     # Only fall back to description if both attempts fail.
     assignee_set_in_ado = False
     assignee_line = None
-    if assignee:
+    if _want('assignee') and assignee:
         display_name = jira_ticket['fields']['assignee']['displayName']
         # Build candidate list: email (if different from display name) then display name
         candidates = []
@@ -686,6 +750,8 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
                 if assignee != display_name
                 else f'<b>Assignee:</b> {display_name}'
             )
+    elif not _want('assignee'):
+        pass  # field not selected — skip
     else:
         # No Jira assignee — explicitly clear System.AssignedTo so ADO does not
         # auto-assign to the API token owner (the request creator).
@@ -701,145 +767,157 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     reporter_email   = reporter_info.get('emailAddress', '')
     reporter_set_in_ado = False
     reporter_line = None
-    reporter_candidates = [c for c in [reporter_email, reporter_display] if c]
-    for candidate in reporter_candidates:
+    if _want('reporter'):
+        reporter_candidates = [c for c in [reporter_email, reporter_display] if c]
+        for candidate in reporter_candidates:
+            try:
+                ado_client.update_field(ado_id, '/fields/Custom.RequestedBy', candidate)
+                reporter_set_in_ado = True
+                break
+            except Exception:
+                continue
+        if not reporter_set_in_ado:
+            logging.info(f"[reporter] {reporter_display} not in ADO for {jira_key} — stored in description")
+            reporter_line = (
+                f'<b>Reporter:</b> {reporter_display} ({reporter_email})'
+                if reporter_email else
+                f'<b>Reporter:</b> {reporter_display}'
+            )
+    # Always write reporter/assignee fallback lines to description even when
+    # 'description' was excluded from the field filter — identity info must not be silently lost.
+    if assignee_line or reporter_line:
         try:
-            ado_client.update_field(ado_id, '/fields/Custom.RequestedBy', candidate)
-            reporter_set_in_ado = True
-            break
-        except Exception:
-            continue
-    if not reporter_set_in_ado:
-        logging.info(f"[reporter] {reporter_display} not in ADO for {jira_key} — stored in description")
-        reporter_line = (
-            f'<b>Reporter:</b> {reporter_display} ({reporter_email})'
-            if reporter_email else
-            f'<b>Reporter:</b> {reporter_display}'
-        )
-    try:
-        live_item = ado_client.get_work_item_full(ado_id)
-        current_desc = (live_item or {}).get('fields', {}).get('System.Description') or description
-        updated_desc = _build_description_with_metadata(current_desc, reporter_line, assignee_line)
-        if updated_desc != current_desc:
-            ado_client.update_field(ado_id, '/fields/System.Description', updated_desc)
-    except Exception as e:
-        logging.warning(f"[create_or_update_work_item] Could not upsert reporter/assignee lines for {jira_key}: {e}")
+            live_item = ado_client.get_work_item_full(ado_id)
+            current_desc = (live_item or {}).get('fields', {}).get('System.Description') or description
+            updated_desc = _build_description_with_metadata(current_desc, reporter_line, assignee_line)
+            if updated_desc != current_desc:
+                ado_client.update_field(ado_id, '/fields/System.Description', updated_desc)
+        except Exception as e:
+            logging.warning(f"[create_or_update_work_item] Could not upsert reporter/assignee lines for {jira_key}: {e}")
 
     # ---- Custom fields ----
-    logging.debug(f"[main] Updating custom fields for: {ado_id}")
-    sync_custom_fields(ado_id, jira_ticket, ado_client, custom_fields)
-    logging.debug(f"[main] Finished updating custom fields for: {ado_id}")
+    if _want('custom_fields'):
+        logging.debug(f"[main] Updating custom fields for: {ado_id}")
+        sync_custom_fields(ado_id, jira_ticket, ado_client, custom_fields)
+        logging.debug(f"[main] Finished updating custom fields for: {ado_id}")
 
     # ---- Priority ----
-    _jira_prio = (jira_ticket['fields'].get('priority') or {}).get('name') or ''
-    match _jira_prio:
-        case 'Highest': _ado_prio = '1-Critical'
-        case 'High':    _ado_prio = '2-High'
-        case 'Medium':  _ado_prio = '3-Medium'
-        case 'Low':     _ado_prio = '4-Low'
-        case 'Lowest':  _ado_prio = '4-Low'
-        case _:         _ado_prio = '3-Medium'  # default when Jira priority is null
-    try:
-        ado_client.update_field(ado_id, '/fields/Custom.PriorityLevel', _ado_prio)
-        logging.info(f"[priority] ✅ {jira_key}: '{_jira_prio or '(none)'}' → '{_ado_prio}'")
-    except Exception as e:
-        logging.warning(f"[priority] ❌ {jira_key}: could not set '{_ado_prio}': {e}")
+    if _want('priority'):
+        _jira_prio = (jira_ticket['fields'].get('priority') or {}).get('name') or ''
+        match _jira_prio:
+            case 'Highest': _ado_prio = '1-Critical'
+            case 'High':    _ado_prio = '2-High'
+            case 'Medium':  _ado_prio = '3-Medium'
+            case 'Low':     _ado_prio = '4-Low'
+            case 'Lowest':  _ado_prio = '4-Low'
+            case _:         _ado_prio = '3-Medium'  # default when Jira priority is null
+        try:
+            ado_client.update_field(ado_id, '/fields/Custom.PriorityLevel', _ado_prio)
+            logging.info(f"[priority] ✅ {jira_key}: '{_jira_prio or '(none)'}' → '{_ado_prio}'")
+        except Exception as e:
+            logging.warning(f"[priority] ❌ {jira_key}: could not set '{_ado_prio}': {e}")
 
     # ---- Date fields ----
-    # ONLY Actual Start Date is populated (from Jira created).
-    # All other date fields are explicitly cleared to null.
-    def _to_ado_dt(jira_ts: str) -> str:
-        # Use the LOCAL date from the Jira timestamp's own timezone offset.
-        # Storing noon UTC of that local date ensures ADO renders the correct
-        # calendar date in any US timezone (UTC-4 through UTC-8), because
-        # ADO Date fields strip the time to midnight UTC which shifts the
-        # display by -1 day in western timezones when we naively use UTC date.
-        dt = _parse_dt(jira_ts)          # preserves original tz offset from Jira
-        local_date = dt.strftime('%Y-%m-%d')   # date as shown in Jira's UI
-        return f'{local_date}T12:00:00.000Z'   # noon UTC → renders correctly in all US timezones
+    if _want('dates'):
+        # ONLY Actual Start Date is populated (from Jira created).
+        # All other date fields are explicitly cleared to null.
+        def _to_ado_dt(jira_ts: str) -> str:
+            # Use the LOCAL date from the Jira timestamp's own timezone offset.
+            # Storing noon UTC of that local date ensures ADO renders the correct
+            # calendar date in any US timezone (UTC-4 through UTC-8), because
+            # ADO Date fields strip the time to midnight UTC which shifts the
+            # display by -1 day in western timezones when we naively use UTC date.
+            dt = _parse_dt(jira_ts)          # preserves original tz offset from Jira
+            local_date = dt.strftime('%Y-%m-%d')   # date as shown in Jira's UI
+            return f'{local_date}T12:00:00.000Z'   # noon UTC → renders correctly in all US timezones
 
-    jira_fields = jira_ticket['fields']
+        jira_fields = jira_ticket['fields']
 
-    # Actual Start Date ← Jira created
-    if ts := jira_fields.get('created'):
-        try:
-            ado_client.update_field(ado_id, '/fields/Custom.ActualStartDate', _to_ado_dt(ts))
-        except Exception as e:
-            logging.debug(f"[dates] ActualStartDate not available for {jira_key}: {e}")
-
-    # Explicitly null out TargetDate only; ActualCompletionDate will be set
-    # from the Jira resolution date if one exists (otherwise cleared).
-    _clear_url = (
-        f'{ado_client.organization_url}/{ado_client.project}'
-        f'/_apis/wit/workitems/{ado_id}?api-version=7.0-preview.3&bypassRules=true'
-    )
-    _clear_payload = [
-        {"op": "remove", "path": "/fields/Microsoft.VSTS.Scheduling.TargetDate"},
-    ]
-    try:
-        import requests as _req
-        _req.patch(_clear_url,
-                   auth=(ado_client.username, ado_client.access_token),
-                   headers={'Content-Type': 'application/json-patch+json'},
-                   json=_clear_payload)
-    except Exception:
-        pass
-
-    # Set ActualCompletionDate from Jira resolution date if present, otherwise clear it.
-    jira_resolution = jira_fields.get('resolutiondate')
-    try:
-        if jira_resolution:
+        # Actual Start Date ← Jira created
+        if ts := jira_fields.get('created'):
             try:
-                formatted_date = _to_ado_dt(jira_resolution)
-                ado_client.update_field(ado_id, '/fields/Custom.ActualCompletionDate', formatted_date)
-                logging.info(f"[dates] Set ActualCompletionDate for {jira_key}: {jira_resolution} → {formatted_date}")
+                ado_client.update_field(ado_id, '/fields/Custom.ActualStartDate', _to_ado_dt(ts))
             except Exception as e:
-                logging.warning(f"[dates] Could not set ActualCompletionDate for {jira_key}: {e}")
-        else:
-            # Remove the field to ensure it's null in ADO
-            logging.debug(f"[dates] No resolution date for {jira_key} — clearing ActualCompletionDate in ADO")
-            try:
-                _req = __import__('requests')
-                _req.patch(_clear_url,
-                           auth=(ado_client.username, ado_client.access_token),
-                           headers={'Content-Type': 'application/json-patch+json'},
-                           json=[{"op": "remove", "path": "/fields/Custom.ActualCompletionDate"}])
-            except Exception:
-                pass
-    except Exception as e:
-        # Defensive: do not fail the whole worker if date logic fails
-        logging.warning(f"[dates] Unexpected error handling resolution date for {jira_key}: {e}")
+                logging.debug(f"[dates] ActualStartDate not available for {jira_key}: {e}")
+
+        # Explicitly null out TargetDate only; ActualCompletionDate will be set
+        # from the Jira resolution date if one exists (otherwise cleared).
+        _clear_url = (
+            f'{ado_client.organization_url}/{ado_client.project}'
+            f'/_apis/wit/workitems/{ado_id}?api-version=7.0-preview.3&bypassRules=true'
+        )
+        _clear_payload = [
+            {"op": "remove", "path": "/fields/Microsoft.VSTS.Scheduling.TargetDate"},
+        ]
+        try:
+            import requests as _req
+            _req.patch(_clear_url,
+                       auth=(ado_client.username, ado_client.access_token),
+                       headers={'Content-Type': 'application/json-patch+json'},
+                       json=_clear_payload)
+        except Exception:
+            pass
+
+        # Set ActualCompletionDate from Jira resolution date if present, otherwise clear it.
+        jira_resolution = jira_fields.get('resolutiondate')
+        try:
+            if jira_resolution:
+                try:
+                    formatted_date = _to_ado_dt(jira_resolution)
+                    ado_client.update_field(ado_id, '/fields/Custom.ActualCompletionDate', formatted_date)
+                    logging.info(f"[dates] Set ActualCompletionDate for {jira_key}: {jira_resolution} → {formatted_date}")
+                except Exception as e:
+                    logging.warning(f"[dates] Could not set ActualCompletionDate for {jira_key}: {e}")
+            else:
+                # Remove the field to ensure it's null in ADO
+                logging.debug(f"[dates] No resolution date for {jira_key} — clearing ActualCompletionDate in ADO")
+                try:
+                    _req = __import__('requests')
+                    _req.patch(_clear_url,
+                               auth=(ado_client.username, ado_client.access_token),
+                               headers={'Content-Type': 'application/json-patch+json'},
+                               json=[{"op": "remove", "path": "/fields/Custom.ActualCompletionDate"}])
+                except Exception:
+                    pass
+        except Exception as e:
+            # Defensive: do not fail the whole worker if date logic fails
+            logging.warning(f"[dates] Unexpected error handling resolution date for {jira_key}: {e}")
 
     # ---- Labels / tags (merge, do not overwrite existing tags) ----
-    labels = jira_ticket['fields'].get('labels', [])
-    sprint_fields = jira_ticket['fields'].get('customfield_10007') or []
-    sprint_names = [s.get('name', '') for s in sprint_fields if isinstance(s, dict) and s.get('name')]
-    all_new_tags = labels + sprint_names
-    if all_new_tags:
-        item = ado_client.get_work_item_full(ado_id)
-        existing_tags = (item.get('fields', {}).get('System.Tags') or '').strip() if item else ''
-        tag_parts = [t.strip() for t in existing_tags.split(';') if t.strip()]
-        tag_parts_lower = {t.lower() for t in tag_parts}
-        for tag in all_new_tags:
-            if tag and tag.lower() not in tag_parts_lower:
-                tag_parts.append(tag)
-                tag_parts_lower.add(tag.lower())
-        ado_client.update_field(ado_id, '/fields/System.Tags', '; '.join(tag_parts))
+    jira_fields = jira_ticket['fields']  # re-bind in case dates block was skipped
+    _want_labels = _want('labels')
+    _want_sprint = _want('sprint')
+    if _want_labels or _want_sprint:
+        labels = jira_fields.get('labels', []) if _want_labels else []
+        sprint_fields = jira_fields.get('customfield_10007') or [] if _want_sprint else []
+        sprint_names = [s.get('name', '') for s in sprint_fields if isinstance(s, dict) and s.get('name')]
+        all_new_tags = labels + sprint_names
+        if all_new_tags:
+            item = ado_client.get_work_item_full(ado_id)
+            existing_tags = (item.get('fields', {}).get('System.Tags') or '').strip() if item else ''
+            tag_parts = [t.strip() for t in existing_tags.split(';') if t.strip()]
+            tag_parts_lower = {t.lower() for t in tag_parts}
+            for tag in all_new_tags:
+                if tag and tag.lower() not in tag_parts_lower:
+                    tag_parts.append(tag)
+                    tag_parts_lower.add(tag.lower())
+            ado_client.update_field(ado_id, '/fields/System.Tags', '; '.join(tag_parts))
 
     # ---- Attachments ----
-    attachment_dict = sync_attachments(ado_id, jira_ticket, jira_client, ado_client,
-                                       skip_attachments=skip_attachments)
-    try:
-        removed = ado_client.remove_duplicate_attachment_relations(ado_id)
-        if removed:
-            logging.info(f"[sync_attachments] Removed {removed} duplicate attachment relation(s) on {ado_id}")
-    except Exception as e:
-        logging.warning(f"[sync_attachments] Could not remove duplicate attachment relations on {ado_id}: {e}")
+    if _want('attachments'):
+        attachment_dict = sync_attachments(ado_id, jira_ticket, jira_client, ado_client,
+                                           skip_attachments=skip_attachments)
+        try:
+            removed = ado_client.remove_duplicate_attachment_relations(ado_id)
+            if removed:
+                logging.info(f"[sync_attachments] Removed {removed} duplicate attachment relation(s) on {ado_id}")
+        except Exception as e:
+            logging.warning(f"[sync_attachments] Could not remove duplicate attachment relations on {ado_id}: {e}")
+    else:
+        attachment_dict = {}
 
     # ---- Update description image links ----
-    # Fetch the live ADO description (reporter/assignee already appended)
-    # so those lines are preserved when replacing Jira image URLs.
-    if '<img src=' in description.lower() and attachment_dict:
+    if _want('description') and '<img src=' in (description or '').lower() and attachment_dict:
         img_links = re.findall('<img src="([^"]+)" alt="([^"]+)"', description)
         live_item = ado_client.get_work_item_full(ado_id)
         current_desc = (live_item or {}).get('fields', {}).get('System.Description') or description
@@ -851,10 +929,12 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             ado_client.update_field(ado_id, '/fields/System.Description', updated_desc)
 
     # ---- Comments ----
-    sync_comments(ado_id, jira_id, jira_client, ado_client, attachment_dict)
+    if _want('comments'):
+        sync_comments(ado_id, jira_id, jira_client, ado_client, attachment_dict)
 
     # ---- Hyperlinks / linked issues ----
-    sync_links(ado_id, jira_ticket, jira_client, jira_id, jira_instance, ado_client, mapping)
+    if _want('links'):
+        sync_links(ado_id, jira_ticket, jira_client, jira_id, jira_instance, ado_client, mapping)
 
     # ---- JiraKey tag — applied last so other updates cannot remove it ----
     ado_client.ensure_jira_key_tag(ado_id, jira_key)
@@ -938,8 +1018,26 @@ def main():
     parser.add_argument('--retry-failed',   action='store_true', help='Re-process all keys recorded in failed_issues.json')
     parser.add_argument('--force-create',   action='store_true', help='Skip duplicate detection — always create new ADO items (use to recover phantom/missing keys)')
     parser.add_argument('--skip-attachments', action='store_true', help='Skip attachment uploads (useful if ADO is timing out on large files)')
+    parser.add_argument('--field-filter',   help='Comma-separated field IDs to migrate (e.g. description,priority). Omit to migrate all fields.')
+    parser.add_argument('--ado-team-name',  help='Override the ADO team/board name (use the Jira board display name instead of project key)')
 
     args = parser.parse_args()
+
+    # If --ado-team-name was provided, use it as the board/team override so ADO
+    # creates the team with the human-readable Jira board name instead of the
+    # raw project key extracted from the JQL.
+    if getattr(args, 'ado_team_name', None):
+        args._detected_team = args.ado_team_name.strip()
+        print(f"[board-detect] Team name override from --ado-team-name: {args._detected_team!r}")
+
+    # None = all fields; a set restricts optional field writes
+    fields_to_migrate = (
+        {f.strip() for f in args.field_filter.split(',') if f.strip()}
+        if args.field_filter else None
+    )
+    if fields_to_migrate:
+        logging.info(f"[main] field-filter active: {sorted(fields_to_migrate)}")
+        print(f"[field-filter] Only migrating: {', '.join(sorted(fields_to_migrate))}")
 
     # --jira-jql: resolve keys up-front so the existing --jira-keys path handles everything
     if args.jira_jql and not args.jira_keys:
@@ -1090,6 +1188,9 @@ def main():
                         f"--ado-project \"{ado_project}\""
                         + (f" --jira-filter {jira_filter}" if jira_filter else ""))
 
+            # PRE-FLIGHT: ensure ADO board/team exists before touching any cards
+            _ensure_board_preflight(ado_client, getattr(args, '_detected_team', None))
+
             # PHASE 2: Process in dependency order
             for jira_key in sorted_keys:
                 jira_ticket = jira_tickets_by_key.get(jira_key)
@@ -1107,7 +1208,8 @@ def main():
                         mapping, type_config, state_config, custom_fields,
                         force_create=args.force_create,
                         detected_team_name=getattr(args, '_detected_team', None),
-                        skip_attachments=args.skip_attachments
+                        skip_attachments=args.skip_attachments,
+                        fields_to_migrate=fields_to_migrate,
                     )
                     if ado_id:
                         logging.info(f"[main] Finished work item: {ado_id}")
@@ -1215,6 +1317,9 @@ def main():
                 ok_team = ado_client.ensure_team(team_name)
                 ok_cfg  = ado_client.configure_team_area(team_name, area_path)
                 ok_iter = ado_client.configure_team_iteration(team_name)
+                iter_path = ado_client.ensure_team_iteration_node(team_name)
+                if iter_path:
+                    _TEAM_ITERATION_PATH[team_name] = iter_path
                 if ok_area and ok_team and ok_cfg and ok_iter:
                     org_name     = ado_client.organization_url.rstrip('/').split('/')[-1]
                     encoded_team = team_name.replace(' ', '%20')
@@ -1286,6 +1391,9 @@ def main():
                     f"--ado-project \"{ado_project}\""
                     + (f" --jira-filter {jira_filter}" if jira_filter else ""))
 
+        # PRE-FLIGHT: ensure ADO board/team exists before touching any cards
+        _ensure_board_preflight(ado_client, getattr(args, '_detected_team', None))
+
         for jira_key in sorted_filter_keys:
             jira_ticket = jira_tickets_by_key_filter.get(jira_key)
             if jira_ticket is None:
@@ -1298,7 +1406,8 @@ def main():
                 ado_id = create_or_update_work_item(
                     jira_ticket, ado_client, jira_client, jira_instance,
                     mapping, type_config, state_config, custom_fields,
-                    detected_team_name=getattr(args, '_detected_team', None)
+                    detected_team_name=getattr(args, '_detected_team', None),
+                    fields_to_migrate=fields_to_migrate,
                 )
                 if ado_id:
                     logging.info(f"[main] Finished work item: {ado_id}")

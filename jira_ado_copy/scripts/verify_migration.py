@@ -891,6 +891,19 @@ def main():
         elif idx % 50 == 0:
             print(f"✅ Processed {idx}/{len(jira_keys)}")
 
+    # Include missing (not-yet-migrated) items in the results so the summary
+    # and CSV report the full Jira set (e.g. "7 total, 5 found, 2 missing")
+    # instead of silently only counting the subset that was migrated.
+    for key in missing_in_ado:
+        results.append({
+            "jira_key":     key,
+            "ado_id":       None,
+            "ado_url":      None,
+            "found_in_ado": False,
+            "all_pass":     False,
+            "checks":       {},
+        })
+
     # ✅ Write CSV if requested
     if args.csv_output and results:
         import csv as _csv
