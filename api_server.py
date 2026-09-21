@@ -24,17 +24,13 @@ import threading
 import uuid
 from datetime import datetime
 from functools import wraps
-from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 
 app = Flask(__name__, static_folder=None)
 
-# Serve static frontend files from web-ui/dist if they exist
-WEB_UI_DIST = Path(__file__).parent / 'web-ui' / 'dist'
-if WEB_UI_DIST.exists():
-    app.static_folder = str(WEB_UI_DIST)
-    app.static_url_path = ''
+# Note: Frontend is now served separately via Nginx (Dockerfile.frontend)
+# This service is API-only. CORS headers handle cross-origin requests.
 
 # Standalone web-ui calls this API directly from the browser (unlike Forge,
 # whose resolvers call it server-to-server), so CORS headers are required.
@@ -1212,33 +1208,8 @@ def analyze():
     return jsonify(result)
 
 
-# ---------------------------------------------------------------------------
-# Static Frontend Serving
-# ---------------------------------------------------------------------------
-
-@app.route('/')
-def serve_index():
-    """Serve the frontend index.html."""
-    if WEB_UI_DIST.exists():
-        index_path = WEB_UI_DIST / 'index.html'
-        if index_path.exists():
-            return send_from_directory(str(WEB_UI_DIST), 'index.html')
-    return jsonify({'error': 'Frontend not deployed (web-ui/dist not found)'}), 404
-
-
-@app.route('/<path:path>')
-def serve_static(path):
-    """Serve static assets (JS, CSS, images) or fallback to index.html for client-side routing."""
-    if WEB_UI_DIST.exists():
-        # If the requested file exists (CSS, JS, images), serve it
-        file_path = WEB_UI_DIST / path
-        if file_path.exists() and file_path.is_file():
-            return send_from_directory(str(WEB_UI_DIST), path)
-        # Otherwise, serve index.html for client-side routing (SPA)
-        index_path = WEB_UI_DIST / 'index.html'
-        if index_path.exists():
-            return send_from_directory(str(WEB_UI_DIST), 'index.html')
-    return jsonify({'error': 'Frontend not deployed (web-ui/dist not found)'}), 404
+# Note: Frontend is now served separately via Nginx container
+# This backend is API-only
 
 
 # ---------------------------------------------------------------------------

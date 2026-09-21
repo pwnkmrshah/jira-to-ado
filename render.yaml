@@ -1,15 +1,26 @@
 services:
+  # Backend API Service
   - type: web
-    name: jira-to-ado
+    name: jira-to-ado-api
     runtime: docker
-    
-    # Environment variables (set these in Render dashboard)
+    dockerfilePath: Dockerfile.backend
     envVars:
       - key: FLASK_ENV
         value: production
       - key: PORT
         value: 10000
       - key: MIGRATION_API_KEY
-        sync: false  # Keep as secret, don't sync from git
+        sync: false  # Keep as secret, set in Render dashboard
       - key: CORS_ALLOWED_ORIGINS
         value: "*"
+
+  # Frontend UI Service  
+  - type: web
+    name: jira-to-ado-web
+    runtime: docker
+    dockerfilePath: Dockerfile.frontend
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://jira-to-ado-api.onrender.com  # Points to backend service
+      - key: PORT
+        value: 3000

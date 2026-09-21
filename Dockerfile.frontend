@@ -1,0 +1,26 @@
+# Dockerfile.frontend - React + Nginx
+FROM node:18-alpine AS builder
+
+WORKDIR /app/web-ui
+COPY web-ui/package*.json ./
+RUN npm install
+COPY web-ui .
+RUN npm run build
+
+# Nginx stage
+FROM nginx:alpine
+
+WORKDIR /app
+
+# Copy Nginx config
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Copy built React app
+COPY --from=builder /app/web-ui/dist /usr/share/nginx/html
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:3000/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
