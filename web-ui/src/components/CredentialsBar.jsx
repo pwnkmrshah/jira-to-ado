@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { api, loadCreds, saveCreds, clearCreds } from '../lib/api.js';
+import { getApiKey } from '../lib/apiKeyManager.js';
 
 export default function CredentialsBar({ onSaved }) {
   const initial = loadCreds();
@@ -15,6 +16,27 @@ export default function CredentialsBar({ onSaved }) {
   const [testMsg, setTestMsg] = useState('');
   const [expanded, setExpanded] = useState(!initial.apiKey);
   const [testPassed, setTestPassed] = useState(!!initial.apiKey); // Track if validation succeeded
+
+  // Auto-load API key based on backend URL environment
+  useEffect(() => {
+    if (!apiBaseUrl) return;
+    
+    const loadApiKey = async () => {
+      try {
+        const key = await getApiKey(apiBaseUrl);
+        setApiKey(key);
+        // Don't reset test status on key load - just set the key
+      } catch (err) {
+        console.error('Error loading API key:', err.message);
+        // For production URL, ask user to enter key manually
+        if (!apiBaseUrl.includes('localhost')) {
+          setApiKey(''); // Clear field to prompt user
+        }
+      }
+    };
+    
+    loadApiKey();
+  }, [apiBaseUrl]);
 
   const canSave = apiKey.trim() && jiraUrl.trim() && jiraEmail.trim() && jiraToken.trim();
   const canTest = canSave && testStatus !== 'testing';
@@ -48,9 +70,12 @@ export default function CredentialsBar({ onSaved }) {
     setTestStatus('testing');
     setTestPassed(false);
     try {
+      // Normalize API base URL (remove trailing slash)
+      const baseUrl = apiBaseUrl.trim().replace(/\/$/, '');
+
       // Test Jira credentials using strict validation endpoint
       const jiraResp = await fetch(
-        `${apiBaseUrl.trim()}/validate-jira-creds?jira_url=${encodeURIComponent(jiraUrl.trim())}&jira_email=${encodeURIComponent(jiraEmail.trim())}&jira_token=${encodeURIComponent(jiraToken.trim())}`,
+        `${baseUrl}/validate-jira-creds?jira_url=${encodeURIComponent(jiraUrl.trim())}&jira_email=${encodeURIComponent(jiraEmail.trim())}&jira_token=${encodeURIComponent(jiraToken.trim())}`,
         {
           headers: { 'X-API-Key': apiKey.trim() },
         }
@@ -63,7 +88,7 @@ export default function CredentialsBar({ onSaved }) {
 
       // Test ADO credentials using strict validation endpoint
       const adoResp = await fetch(
-        `${apiBaseUrl.trim()}/validate-ado-creds?ado_org=${encodeURIComponent(adoOrg.trim())}&ado_pat=${encodeURIComponent(adoPat.trim())}`,
+        `${baseUrl}/validate-ado-creds?ado_org=${encodeURIComponent(adoOrg.trim())}&ado_pat=${encodeURIComponent(adoPat.trim())}`,
         {
           headers: { 'X-API-Key': apiKey.trim() },
         }
@@ -125,6 +150,9 @@ export default function CredentialsBar({ onSaved }) {
         <label>
           Backend API key
           <input type="password" value={apiKey} onChange={handleCredChange(setApiKey)} placeholder="X-API-Key" />
+          <small style={{ display: 'block', marginTop: '4px', opacity: 0.8 }}>
+            {apiBaseUrl.includes('localhost') ? '🔓 Local dev key' : '🔐 Fetched from Azure Key Vault'}
+          </small>
         </label>
         <label>
           Jira URL

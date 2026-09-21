@@ -85,7 +85,9 @@ API_KEY = os.environ.get('MIGRATION_API_KEY', 'demo-key-change-me')
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if request.headers.get('X-API-Key') != API_KEY:
+        provided_key = request.headers.get('X-API-Key', '')
+        if provided_key != API_KEY:
+            logging.warning(f'API key check failed: provided="{provided_key[:10]}..." expected="{API_KEY[:10]}..."')
             return jsonify({'error': 'Unauthorized'}), 401
         return f(*args, **kwargs)
     return decorated
@@ -482,18 +484,44 @@ def validate_jira_creds():
 
     auth = (jira_email, jira_token)
     try:
+        # Use /myself endpoint which ALWAYS requires valid authentication
+        test_url = f'{jira_url.rstrip("/")}/rest/api/3/myself'
+        logging.info(f'[JIRA VALIDATION] Testing: {test_url}')
+        logging.info(f'[JIRA VALIDATION] Auth: email={jira_email}')
         resp = req.get(
-            f'{jira_url.rstrip("/")}/rest/api/3/project/search?maxResults=1',
+            test_url,
             auth=auth,
             timeout=10
         )
+        logging.info(f'[JIRA VALIDATION] Response status: {resp.status_code}')
+        logging.info(f'[JIRA VALIDATION] Response body: {resp.text[:200]}')
+        
         if resp.status_code == 401:
+            logging.warning(f'Jira 401: {resp.text}')
             return jsonify({'error': 'Jira authentication failed. Check your email and API token.'}), 401
         if resp.status_code == 403:
+            logging.warning(f'Jira 403: {resp.text}')
             return jsonify({'error': 'Jira access denied. Check your account permissions.'}), 403
         if resp.status_code == 404:
+            logging.warning(f'Jira 404: {resp.text}')
             return jsonify({'error': 'Jira URL not found. Check your Jira instance URL.'}), 404
-        resp.raise_for_status()
+        
+        # STRICT: Only accept 200 OK, reject all other status codes
+        if resp.status_code != 200:
+            logging.warning(f'[JIRA VALIDATION] Unexpected status {resp.status_code}: {resp.text[:100]}')
+            return jsonify({'error': f'Jira returned unexpected status {resp.status_code}. Check your credentials.'}), 401
+        
+        # Validate response is valid JSON with expected structure (must have accountId)
+        try:
+            data = resp.json()
+            if not isinstance(data, dict) or 'accountId' not in data:
+                logging.warning(f'[JIRA VALIDATION] Invalid response structure: {data}')
+                return jsonify({'error': 'Jira returned invalid response. Authentication may have failed.'}), 401
+        except Exception as e:
+            logging.warning(f'[JIRA VALIDATION] Failed to parse response: {e}')
+            return jsonify({'error': 'Jira returned non-JSON response. Authentication may have failed.'}), 401
+        
+        logging.info(f'[JIRA VALIDATION] ✅ SUCCESS')
         return jsonify({'valid': True, 'message': 'Jira credentials validated successfully'})
     except Exception as exc:
         logging.error(f'Jira validation failed: {exc}')
@@ -533,14 +561,38 @@ def validate_ado_creds():
 
     url = f'https://dev.azure.com/{ado_org}/_apis/projects?api-version=7.0&$top=1'
     try:
+        logging.info(f'[ADO VALIDATION] Testing: {url}')
+        logging.info(f'[ADO VALIDATION] Org: {ado_org}')
         resp = req.get(url, headers=headers, timeout=10)
+        logging.info(f'[ADO VALIDATION] Response status: {resp.status_code}')
+        logging.info(f'[ADO VALIDATION] Response body: {resp.text[:200]}')
+        
         if resp.status_code == 401:
+            logging.warning(f'[ADO VALIDATION] 401 - Auth failed: {resp.text}')
             return jsonify({'error': 'ADO authentication failed. Check your PAT.'}), 401
         if resp.status_code == 403:
+            logging.warning(f'[ADO VALIDATION] 403 - Access denied: {resp.text}')
             return jsonify({'error': 'ADO access denied. Check your permissions.'}), 403
         if resp.status_code == 404:
+            logging.warning(f'[ADO VALIDATION] 404 - Not found: {resp.text}')
             return jsonify({'error': 'ADO organization not found. Check your organization name.'}), 404
-        resp.raise_for_status()
+        
+        # STRICT: Only accept 200 OK, reject all other status codes
+        if resp.status_code != 200:
+            logging.warning(f'[ADO VALIDATION] Unexpected status {resp.status_code}: {resp.text[:100]}')
+            return jsonify({'error': f'ADO returned unexpected status {resp.status_code}. Check your credentials.'}), 401
+        
+        # Validate response is valid JSON with expected structure
+        try:
+            data = resp.json()
+            if not isinstance(data, dict) or 'value' not in data:
+                logging.warning(f'[ADO VALIDATION] Invalid response structure: {data}')
+                return jsonify({'error': 'ADO returned invalid response. Authentication may have failed.'}), 401
+        except Exception as e:
+            logging.warning(f'[ADO VALIDATION] Failed to parse response: {e}')
+            return jsonify({'error': 'ADO returned non-JSON response. Authentication may have failed.'}), 401
+        
+        logging.info(f'[ADO VALIDATION] ✅ SUCCESS')
         return jsonify({'valid': True, 'message': 'ADO credentials validated successfully'})
     except Exception as exc:
         logging.error(f'ADO validation failed: {exc}')
@@ -605,37 +657,23 @@ def ado_boards():
 def ado_projects():
     """
     Return all Azure DevOps projects for the given organisation and PAT.
-    Query params:
-      - ado_org: ADO organization (optional, falls back to env/config)
-      - ado_pat: ADO personal access token (optional, falls back to env/config)
+    IMPORTANT: Credentials come ONLY from UI (query params), NEVER from env vars or config files.
     
-    If ado_org and ado_pat are provided in query params, they are tested.
-    Otherwise falls back to environment variables and config file.
+    Query params (REQUIRED):
+      - ado_org: ADO organization name
+      - ado_pat: ADO personal access token
     """
     import requests as req
 
     ado_org = request.args.get('ado_org', '').strip()
     ado_pat = request.args.get('ado_pat', '').strip()
 
-    # Fall back to environment variables
+    # STRICT: NO fallback to env vars or config files
+    # Credentials MUST come from UI only
     if not ado_org:
-        ado_org = os.environ.get('ADO_ORG', '')
+        return jsonify({'error': 'ado_org is required (must be provided from UI)'}), 400
     if not ado_pat:
-        ado_pat = os.environ.get('ADO_PAT', '')
-
-    # Fall back to config file when env vars are absent
-    if not ado_org or not ado_pat:
-        config_path = REPO_ROOT / 'config' / 'ado_config.json'
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-            if not ado_org:
-                # config uses 'organization' key directly (not a full URL)
-                ado_org = config.get('organization') or config.get('organization_url', '').rstrip('/').split('/')[-1]
-            if not ado_pat:
-                ado_pat = config.get('access_token', '')
-
-    if not ado_org or not ado_pat:
-        return jsonify({'error': 'ADO_ORG and ADO_PAT must be provided (as query params or env/config)'}), 400
+        return jsonify({'error': 'ado_pat is required (must be provided from UI)'}), 400
 
     credentials = base64.b64encode(f':{ado_pat}'.encode()).decode()
     headers = {
@@ -667,7 +705,12 @@ def ado_projects():
 def jira_projects():
     """
     Return all Jira projects accessible to the authenticated user.
-    Uses credentials from the request or forwarded from Forge.
+    IMPORTANT: Credentials come ONLY from UI (query params), NEVER from env vars or config files.
+    
+    Query params (REQUIRED):
+      - jira_url: Full Jira instance URL
+      - jira_email: Jira account email
+      - jira_token: Jira API token
     """
     import requests as req
 
@@ -675,20 +718,14 @@ def jira_projects():
     jira_email = request.args.get('jira_email', '').strip()
     jira_token = request.args.get('jira_token', '').strip()
 
-    # Fall back to saved config if not provided
-    if not jira_url or not jira_email or not jira_token:
-        config_path = REPO_ROOT / 'config' / 'jira_config.json'
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-            if not jira_url:
-                jira_url = config.get('url', '')
-            if not jira_email:
-                jira_email = config.get('email', '')
-            if not jira_token:
-                jira_token = config.get('token', '')
-
-    if not jira_url or not jira_email or not jira_token:
-        return jsonify({'error': 'Jira credentials not provided or configured (url, email, token)'}), 400
+    # STRICT: NO fallback to config files or env vars
+    # Credentials MUST come from UI only
+    if not jira_url:
+        return jsonify({'error': 'jira_url is required (must be provided from UI)'}), 400
+    if not jira_email:
+        return jsonify({'error': 'jira_email is required (must be provided from UI)'}), 400
+    if not jira_token:
+        return jsonify({'error': 'jira_token is required (must be provided from UI)'}), 400
 
     auth = (jira_email, jira_token)
     try:
@@ -715,6 +752,12 @@ def jira_projects():
 def jira_filters():
     """
     Return all Jira filters accessible to the authenticated user.
+    IMPORTANT: Credentials come ONLY from UI (query params), NEVER from env vars or config files.
+    
+    Query params (REQUIRED):
+      - jira_url: Full Jira instance URL
+      - jira_email: Jira account email
+      - jira_token: Jira API token
     """
     import requests as req
 
@@ -722,19 +765,14 @@ def jira_filters():
     jira_email = request.args.get('jira_email', '').strip()
     jira_token = request.args.get('jira_token', '').strip()
 
-    if not jira_url or not jira_email or not jira_token:
-        config_path = REPO_ROOT / 'config' / 'jira_config.json'
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-            if not jira_url:
-                jira_url = config.get('url', '')
-            if not jira_email:
-                jira_email = config.get('email', '')
-            if not jira_token:
-                jira_token = config.get('token', '')
-
-    if not jira_url or not jira_email or not jira_token:
-        return jsonify({'error': 'Jira credentials not provided or configured'}), 400
+    # STRICT: NO fallback to config files or env vars
+    # Credentials MUST come from UI only
+    if not jira_url:
+        return jsonify({'error': 'jira_url is required (must be provided from UI)'}), 400
+    if not jira_email:
+        return jsonify({'error': 'jira_email is required (must be provided from UI)'}), 400
+    if not jira_token:
+        return jsonify({'error': 'jira_token is required (must be provided from UI)'}), 400
 
     auth = (jira_email, jira_token)
     try:
