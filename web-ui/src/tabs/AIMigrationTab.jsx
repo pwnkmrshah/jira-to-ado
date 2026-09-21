@@ -1,18 +1,39 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { api, loadCreds } from '../lib/api.js';
 
 export default function AIMigrationTab() {
   const creds = loadCreds();
-  const [jiraProjectKey, setJiraProjectKey] = useState('');
+  const [adoProjects, setAdoProjects] = useState([]);
+  const [selectedAdoProject, setSelectedAdoProject] = useState(creds.adoProject || '');
   const [adoOrg, setAdoOrg] = useState('');
-  const [adoProject, setAdoProject] = useState(creds.adoProject || '');
+  const [loadingProjects, setLoadingProjects] = useState(false);
+  
+  const [jiraProjectKey, setJiraProjectKey] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [fieldFilter, setFieldFilter] = useState('');
+  
   const [analysisResult, setAnalysisResult] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState('');
 
-  const canAnalyze = !isAnalyzing && jiraProjectKey.trim() && adoOrg.trim() && adoProject.trim();
+  // Fetch ADO projects on mount
+  useEffect(() => {
+    const fetchAdoProjects = async () => {
+      setLoadingProjects(true);
+      try {
+        const result = await api.adoProjects();
+        setAdoProjects(result.projects || []);
+      } catch (err) {
+        console.error('Failed to fetch ADO projects:', err);
+        setAnalysisError('Could not fetch ADO projects. Check your connection settings.');
+      } finally {
+        setLoadingProjects(false);
+      }
+    };
+    fetchAdoProjects();
+  }, []);
+
+  const canAnalyze = !isAnalyzing && jiraProjectKey.trim() && selectedAdoProject.trim();
 
   const handleAnalyze = async () => {
     setIsAnalyzing(true);
@@ -21,8 +42,7 @@ export default function AIMigrationTab() {
     try {
       const result = await api.analyze({
         jira_project_key: jiraProjectKey.trim(),
-        ado_org: adoOrg.trim(),
-        ado_project: adoProject.trim(),
+        ado_project: selectedAdoProject.trim(),
         status_filter: statusFilter.trim() ? statusFilter.split(',').map(s => s.trim()) : [],
         field_filter: fieldFilter.trim() ? fieldFilter.split(',').map(s => s.trim()) : [],
       });
@@ -36,77 +56,125 @@ export default function AIMigrationTab() {
 
   return (
     <section className="tab-panel">
-      <h2>AI Migration Analysis</h2>
-      <p className="hint">Analyze your Jira project to identify migration gaps and opportunities.</p>
+      <h2>🚀 Start AI Migration</h2>
+      <p className="hint">Choose your source, scope, and destination. We'll analyze the migration before anything is changed.</p>
 
-      <div className="field-row">
-        <label htmlFor="ai-jira-project">Jira Project Key</label>
-        <input 
-          id="ai-jira-project" 
-          value={jiraProjectKey} 
-          onChange={(e) => setJiraProjectKey(e.target.value)} 
-          placeholder="e.g. TM, PROJ" 
-        />
+      {/* SOURCE SECTION */}
+      <div className="form-section">
+        <h3>SOURCE</h3>
+        <div className="field-row">
+          <label htmlFor="ai-jira-project">Jira Board *</label>
+          <input 
+            id="ai-jira-project" 
+            type="text"
+            value={jiraProjectKey} 
+            onChange={(e) => setJiraProjectKey(e.target.value)} 
+            placeholder="Enter Jira project key (e.g., TM, PROJ)" 
+          />
+          <small>Enter the Jira project key to analyze</small>
+        </div>
       </div>
 
-      <div className="field-row">
-        <label htmlFor="ai-ado-org">ADO Organization</label>
-        <input 
-          id="ai-ado-org" 
-          value={adoOrg} 
-          onChange={(e) => setAdoOrg(e.target.value)} 
-          placeholder="e.g. your-org" 
-        />
+      {/* SCOPE SECTION */}
+      <div className="form-section">
+        <h3>SCOPE</h3>
+        <div className="field-row">
+          <label>Migration Scope *</label>
+          <select defaultValue="entire-board" disabled>
+            <option value="entire-board">Entire board</option>
+          </select>
+          <small>All issues from the selected Jira project</small>
+        </div>
       </div>
 
-      <div className="field-row">
-        <label htmlFor="ai-ado-project">ADO Project</label>
-        <input 
-          id="ai-ado-project" 
-          value={adoProject} 
-          onChange={(e) => setAdoProject(e.target.value)} 
-          placeholder="Embedded Refills Engineering" 
-        />
+      {/* TARGET SECTION */}
+      <div className="form-section">
+        <h3>TARGET</h3>
+        <div className="field-row">
+          <label htmlFor="ai-ado-project">Azure DevOps Project *</label>
+          {loadingProjects ? (
+            <select disabled>
+              <option>Loading ADO projects...</option>
+            </select>
+          ) : adoProjects.length > 0 ? (
+            <select 
+              id="ai-ado-project" 
+              value={selectedAdoProject} 
+              onChange={(e) => setSelectedAdoProject(e.target.value)}
+            >
+              <option value="">Select ADO project...</option>
+              {adoProjects.map(project => (
+                <option key={project.id} value={project.name}>{project.name}</option>
+              ))}
+            </select>
+          ) : (
+            <select disabled>
+              <option>No ADO projects available</option>
+            </select>
+          )}
+        </div>
       </div>
 
-      <div className="field-row">
-        <label htmlFor="ai-status-filter">Status Filter (comma-separated, optional)</label>
-        <input 
-          id="ai-status-filter" 
-          value={statusFilter} 
-          onChange={(e) => setStatusFilter(e.target.value)} 
-          placeholder="e.g. Open, In Progress, Done" 
-        />
+      {/* OPTIONAL FILTERS */}
+      <div className="form-section">
+        <h3>OPTIONAL FILTERS</h3>
+        <div className="field-row">
+          <label htmlFor="ai-status-filter">Status Filter (comma-separated)</label>
+          <input 
+            id="ai-status-filter" 
+            value={statusFilter} 
+            onChange={(e) => setStatusFilter(e.target.value)} 
+            placeholder="e.g. Open, In Progress, Done" 
+          />
+          <small>Leave empty to include all statuses</small>
+        </div>
+
+        <div className="field-row">
+          <label htmlFor="ai-field-filter">Field Filter (comma-separated)</label>
+          <input 
+            id="ai-field-filter" 
+            value={fieldFilter} 
+            onChange={(e) => setFieldFilter(e.target.value)} 
+            placeholder="e.g. labels, components" 
+          />
+          <small>Leave empty to include all fields</small>
+        </div>
       </div>
 
-      <div className="field-row">
-        <label htmlFor="ai-field-filter">Field Filter (comma-separated, optional)</label>
-        <input 
-          id="ai-field-filter" 
-          value={fieldFilter} 
-          onChange={(e) => setFieldFilter(e.target.value)} 
-          placeholder="e.g. labels, components, customfield_" 
-        />
+      {/* INFO BOX */}
+      <div className="info-box">
+        <span className="info-icon">ℹ️</span>
+        <div>
+          <strong>What AI will analyze</strong>
+          <ul>
+            <li>Issue types and field mappings</li>
+            <li>User and status compatibility</li>
+            <li>Custom fields and attachments</li>
+            <li>Migration gaps and risks</li>
+          </ul>
+        </div>
       </div>
 
+      {/* ACTION BUTTON */}
       <button 
         type="button" 
         className="primary" 
-        disabled={!canAnalyze} 
+        disabled={!canAnalyze || loadingProjects} 
         onClick={handleAnalyze}
       >
-        {isAnalyzing ? 'Analyzing…' : 'Analyze Project'}
+        {isAnalyzing ? '🔄 Analyzing…' : '✨ Analyze & Plan Migration'}
       </button>
 
       {analysisError && <p className="status-fail">❌ {analysisError}</p>}
 
+      {/* RESULTS */}
       {analysisResult && (
         <div className="analysis-results">
-          <h3>Analysis Results</h3>
+          <h3>📊 Analysis Results</h3>
           <div className="result-grid">
             <div className="result-item">
               <label>Total Issues</label>
-              <span>{analysisResult.total_issues}</span>
+              <span className="big-number">{analysisResult.total_issues}</span>
             </div>
             {analysisResult.by_type && Object.entries(analysisResult.by_type).map(([type, count]) => (
               <div key={type} className="result-item">
@@ -117,36 +185,41 @@ export default function AIMigrationTab() {
           </div>
 
           {analysisResult.attachment_count !== undefined && (
-            <p>📎 Attachments: {analysisResult.attachment_count}</p>
+            <p>📎 Attachments: <strong>{analysisResult.attachment_count}</strong></p>
           )}
 
           {analysisResult.comment_count !== undefined && (
-            <p>💬 Comments: {analysisResult.comment_count}</p>
+            <p>💬 Comments: <strong>{analysisResult.comment_count}</strong></p>
           )}
 
           {analysisResult.type_gaps && Object.keys(analysisResult.type_gaps).length > 0 && (
-            <div className="gaps-section">
-              <h4>⚠️ Type Gaps (Jira types not in ADO)</h4>
+            <div className="gaps-section warning">
+              <h4>⚠️ Type Gaps</h4>
+              <p>Jira issue types that need mapping to ADO:</p>
               <ul>
                 {Object.entries(analysisResult.type_gaps).map(([jiraType, adoMapping]) => (
-                  <li key={jiraType}>{jiraType} → {adoMapping || 'No mapping'}</li>
+                  <li key={jiraType}><strong>{jiraType}</strong> → {adoMapping || '❌ No mapping'}</li>
                 ))}
               </ul>
             </div>
           )}
 
           {analysisResult.user_gaps && Object.keys(analysisResult.user_gaps).length > 0 && (
-            <div className="gaps-section">
-              <h4>⚠️ User Gaps (Jira users not in ADO)</h4>
+            <div className="gaps-section warning">
+              <h4>⚠️ User Gaps</h4>
+              <p>Jira users that need to be added to ADO:</p>
               <ul>
-                {Object.entries(analysisResult.user_gaps).map(([jiraUser, adoMapping]) => (
-                  <li key={jiraUser}>{jiraUser} → {adoMapping || 'No mapping'}</li>
+                {Object.entries(analysisResult.user_gaps).slice(0, 10).map(([jiraUser, adoMapping]) => (
+                  <li key={jiraUser}><strong>{jiraUser}</strong> → {adoMapping || '❌ Not in ADO'}</li>
                 ))}
+                {Object.keys(analysisResult.user_gaps).length > 10 && (
+                  <li>... and {Object.keys(analysisResult.user_gaps).length - 10} more users</li>
+                )}
               </ul>
             </div>
           )}
 
-          <p className="hint">Review the analysis results above before proceeding with migration.</p>
+          <p className="hint">✅ Review the analysis above. Once gaps are resolved, you can proceed with migration.</p>
         </div>
       )}
     </section>
