@@ -12,6 +12,11 @@ export default function MigrateTab() {
   const creds = loadCreds();
   const [mode, setMode] = useState('filter');
   
+  // Jira projects
+  const [jiraProjects, setJiraProjects] = useState([]);
+  const [selectedJiraProject, setSelectedJiraProject] = useState('');
+  const [loadingJiraProjects, setLoadingJiraProjects] = useState(false);
+  
   // Jira filters
   const [jiraFilters, setJiraFilters] = useState([]);
   const [selectedFilterId, setSelectedFilterId] = useState('');
@@ -28,12 +33,39 @@ export default function MigrateTab() {
   const [skipAttachments, setSkipAttachments] = useState(false);
   const { job, jobId, startError, isRunning, start } = useJob();
 
-  // Fetch Jira filters on mount
+  // Fetch Jira projects on mount
   useEffect(() => {
+    const fetchProjects = async () => {
+      setLoadingJiraProjects(true);
+      try {
+        const result = await api.jiraProjectsWithCreds(creds.jiraUrl, creds.jiraEmail, creds.jiraToken);
+        setJiraProjects(result.projects || []);
+      } catch (err) {
+        console.error('Failed to fetch Jira projects:', err);
+      } finally {
+        setLoadingJiraProjects(false);
+      }
+    };
+    fetchProjects();
+  }, []);
+
+  // Fetch Jira filters when project is selected
+  useEffect(() => {
+    if (!selectedJiraProject || mode !== 'filter') {
+      setJiraFilters([]);
+      setSelectedFilterId('');
+      return;
+    }
+
     const fetchFilters = async () => {
       setLoadingFilters(true);
       try {
-        const result = await api.jiraFilters();
+        const result = await api.jiraFiltersWithCreds(
+          creds.jiraUrl, 
+          creds.jiraEmail, 
+          creds.jiraToken,
+          selectedJiraProject
+        );
         setJiraFilters(result.filters || []);
       } catch (err) {
         console.error('Failed to fetch Jira filters:', err);
@@ -42,7 +74,7 @@ export default function MigrateTab() {
       }
     };
     fetchFilters();
-  }, []);
+  }, [selectedJiraProject, mode, creds.jiraUrl, creds.jiraEmail, creds.jiraToken]);
 
   // Fetch ADO projects on mount
   useEffect(() => {
@@ -61,7 +93,7 @@ export default function MigrateTab() {
   }, []);
 
   const hasInput = mode === 'filter' ? selectedFilterId : keys.trim();
-  const canRun = !isRunning && selectedAdoProject && hasInput && !loadingFilters && !loadingAdoProjects;
+  const canRun = !isRunning && selectedAdoProject && selectedJiraProject && hasInput && !loadingFilters && !loadingAdoProjects && !loadingJiraProjects;
 
   const handleRun = () => {
     start(() => api.migrate({
@@ -82,6 +114,33 @@ export default function MigrateTab() {
         <select id="migrate-mode" value={mode} onChange={(e) => setMode(e.target.value)}>
           {MODES.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
         </select>
+      </div>
+      
+      <div className="field-row">
+        <label htmlFor="migrate-jira-project">Jira Project *</label>
+        {loadingJiraProjects ? (
+          <select disabled>
+            <option>Loading Jira projects...</option>
+          </select>
+        ) : jiraProjects.length > 0 ? (
+          <select 
+            id="migrate-jira-project" 
+            value={selectedJiraProject} 
+            onChange={(e) => {
+              setSelectedJiraProject(e.target.value);
+              setSelectedFilterId('');
+            }}
+          >
+            <option value="">Select a Jira project...</option>
+            {jiraProjects.map((p) => (
+              <option key={p.key} value={p.key}>{p.name} ({p.key})</option>
+            ))}
+          </select>
+        ) : (
+          <select disabled>
+            <option>No Jira projects available</option>
+          </select>
+        )}
       </div>
       
       {mode === 'filter' ? (

@@ -751,19 +751,23 @@ def jira_projects():
 @require_api_key
 def jira_filters():
     """
-    Return all Jira filters accessible to the authenticated user.
+    Return Jira filters accessible to the authenticated user.
     IMPORTANT: Credentials come ONLY from UI (query params), NEVER from env vars or config files.
     
     Query params (REQUIRED):
       - jira_url: Full Jira instance URL
       - jira_email: Jira account email
       - jira_token: Jira API token
+    
+    Query params (OPTIONAL):
+      - project_key: If provided, return only filters related to this project
     """
     import requests as req
 
     jira_url = request.args.get('jira_url', '').strip()
     jira_email = request.args.get('jira_email', '').strip()
     jira_token = request.args.get('jira_token', '').strip()
+    project_key = request.args.get('project_key', '').strip()
 
     # STRICT: NO fallback to config files or env vars
     # Credentials MUST come from UI only
@@ -785,9 +789,21 @@ def jira_filters():
         resp.raise_for_status()
         data = resp.json()
         filters = [
-            {'id': f['id'], 'name': f['name']}
+            {'id': f['id'], 'name': f['name'], 'jql': f.get('jql', '')}
             for f in data.get('values', [])
         ]
+        
+        # If project_key is specified, filter to show only filters related to that project
+        if project_key:
+            filters = [
+                f for f in filters 
+                if f'project = {project_key}' in f['jql'] or f'project in ({project_key})' in f['jql']
+            ]
+            logging.info(f'[JIRA FILTERS] Filtered {len(filters)} filters for project {project_key}')
+        
+        # Remove JQL from response (client doesn't need it)
+        filters = [{'id': f['id'], 'name': f['name']} for f in filters]
+        
         return jsonify({'filters': filters})
     except Exception as exc:
         logging.error(f'Jira filters fetch failed: {exc}')
