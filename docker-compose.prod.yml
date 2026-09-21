@@ -1,0 +1,61 @@
+version: '3.8'
+
+# Production docker-compose - for Azure or other cloud deployments
+# Usage: docker-compose -f docker-compose.prod.yml up
+
+services:
+  # Backend API service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: jira-ado-api-prod
+    ports:
+      - "10000:10000"
+    environment:
+      FLASK_ENV: production
+      PORT: 10000
+      MIGRATION_API_KEY: ${MIGRATION_API_KEY:?error - MIGRATION_API_KEY must be set}
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+      PYTHONUNBUFFERED: 1
+    # No volumes in production - immutable containers
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Frontend UI service
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: jira-ado-web-prod
+    ports:
+      - "3000:3000"
+    environment:
+      # VITE_API_BASE_URL should point to your production API domain
+      # e.g., https://api.jira-ado.com or https://jira-to-ado-api.onrender.com
+      VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://api:10000}"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

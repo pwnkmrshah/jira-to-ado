@@ -1,26 +1,42 @@
-# Dockerfile.frontend - React + Nginx
+# Stage 1: Build React frontend
 FROM node:18-alpine AS builder
 
 WORKDIR /app/web-ui
-COPY web-ui/package*.json ./
-RUN npm install
-COPY web-ui .
-RUN npm run build
 
-# Nginx stage
+# Copy package files first for better layer caching
+COPY web-ui/package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy source and build
+COPY web-ui .
+RUN npm ci && npm run build
+
+# Stage 2: Nginx server with frontend
 FROM nginx:alpine
 
-WORKDIR /app
+# Add health check dependencies
+RUN apk add --no-cache wget
 
-# Copy Nginx config
+# Remove default nginx config
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy custom Nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
 
-# Copy built React app
+# Copy built React app from builder stage
 COPY --from=builder /app/web-ui/dist /usr/share/nginx/html
+
+# Create nginx user and set permissions
+RUN chown -R nginx:nginx /usr/share/nginx/html && \
+    chmod -R 755 /usr/share/nginx/html
 
 EXPOSE 3000
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost:3000/ || exit 1
+    CMD wget --quiet --tries=1 --spider http://localhost:3000/health || exit 1
+
+# Run as non-root user
+USER nginx
 
 CMD ["nginx", "-g", "daemon off;"]

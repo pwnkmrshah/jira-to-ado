@@ -1,4 +1,4 @@
-# Dockerfile.backend - Flask API only
+# Backend Flask API - Production Ready
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -6,28 +6,37 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos '' appuser
 
-# Copy requirements and install
+# Copy requirements first for better layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend code
+# Copy application code
 COPY api_server.py .
 COPY api/ ./api/
 COPY utilities/ ./utilities/
 COPY config/ ./config/
 COPY jira_ado_copy/ ./jira_ado_copy/
 
+# Set permissions
+RUN chown -R appuser:appuser /app
+
 # Environment
 ENV FLASK_ENV=production
 ENV PORT=10000
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 10000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:10000/').read()" || exit 1
+    CMD curl -f http://localhost:10000/health || exit 1
 
-# Run Flask with gunicorn (API only - no static files)
-CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "2", "--timeout", "60", "api_server:app"]
+# Run as non-root user
+USER appuser
+
+# Run Flask with gunicorn (production WSGI server)
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "2", "--worker-class", "sync", "--timeout", "60", "--access-logfile", "-", "--error-logfile", "-", "api_server:app"]
