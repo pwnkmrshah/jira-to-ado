@@ -9,12 +9,19 @@ export default function AIMigrationTab() {
   const [selectedJiraProject, setSelectedJiraProject] = useState('');
   const [loadingJiraProjects, setLoadingJiraProjects] = useState(false);
   
+  // Jira filters state (for scope)
+  const [jiraFilters, setJiraFilters] = useState([]);
+  const [selectedJiraFilter, setSelectedJiraFilter] = useState('');
+  const [loadingJiraFilters, setLoadingJiraFilters] = useState(false);
+  
   // ADO projects state
   const [adoProjects, setAdoProjects] = useState([]);
   const [selectedAdoProject, setSelectedAdoProject] = useState(creds.adoProject || '');
   const [loadingAdoProjects, setLoadingAdoProjects] = useState(false);
   
-  // Filters
+  // Scope and optional inputs
+  const [scopeType, setScopeType] = useState('entire-board'); // entire-board, filter, specific-issues
+  const [issueKeys, setIssueKeys] = useState(''); // For specific issues
   const [statusFilter, setStatusFilter] = useState('');
   const [fieldFilter, setFieldFilter] = useState('');
   
@@ -40,6 +47,25 @@ export default function AIMigrationTab() {
     fetchJiraProjects();
   }, []);
 
+  // Fetch Jira filters when needed
+  useEffect(() => {
+    if (scopeType === 'filter') {
+      const fetchFilters = async () => {
+        setLoadingJiraFilters(true);
+        try {
+          const result = await api.jiraFilters();
+          setJiraFilters(result.filters || []);
+        } catch (err) {
+          console.error('Failed to fetch Jira filters:', err);
+          setAnalysisError('Could not fetch Jira filters.');
+        } finally {
+          setLoadingJiraFilters(false);
+        }
+      };
+      fetchFilters();
+    }
+  }, [scopeType]);
+
   // Fetch ADO projects on mount
   useEffect(() => {
     const fetchAdoProjects = async () => {
@@ -57,20 +83,42 @@ export default function AIMigrationTab() {
     fetchAdoProjects();
   }, []);
 
-  const canAnalyze = !isAnalyzing && selectedJiraProject && selectedAdoProject && !loadingJiraProjects && !loadingAdoProjects;
+  const canAnalyze = () => {
+    if (isAnalyzing || !selectedJiraProject || !selectedAdoProject || loadingJiraProjects || loadingAdoProjects) {
+      return false;
+    }
+    // Check based on scope type
+    if (scopeType === 'filter') {
+      return selectedJiraFilter && !loadingJiraFilters;
+    }
+    if (scopeType === 'specific-issues') {
+      return issueKeys.trim() !== '';
+    }
+    return true; // entire-board doesn't need additional selection
+  };
 
   const handleAnalyze = async () => {
     setIsAnalyzing(true);
     setAnalysisError('');
     setAnalysisResult(null);
     try {
-      const result = await api.analyze({
-        jira_project_key: selectedJiraProject,
+      // Build analysis payload based on scope type
+      const payload = {
         ado_project: selectedAdoProject,
         ado_org: creds.adoOrg,
         status_filter: statusFilter.trim() ? statusFilter.split(',').map(s => s.trim()) : [],
         field_filter: fieldFilter.trim() ? fieldFilter.split(',').map(s => s.trim()) : [],
-      });
+      };
+
+      if (scopeType === 'entire-board') {
+        payload.jira_project_key = selectedJiraProject;
+      } else if (scopeType === 'filter') {
+        payload.jira_filter_id = selectedJiraFilter;
+      } else if (scopeType === 'specific-issues') {
+        payload.jira_keys = issueKeys.split(',').map(k => k.trim());
+      }
+
+      const result = await api.analyze(payload);
       setAnalysisResult(result);
     } catch (err) {
       setAnalysisError(err.message);
@@ -119,12 +167,67 @@ export default function AIMigrationTab() {
       <div className="form-section">
         <h3>SCOPE</h3>
         <div className="field-row">
-          <label>Migration Scope *</label>
-          <select defaultValue="entire-board" disabled>
+          <label htmlFor="ai-scope">Migration Scope *</label>
+          <select 
+            id="ai-scope" 
+            value={scopeType} 
+            onChange={(e) => {
+              setScopeType(e.target.value);
+              setSelectedJiraFilter('');
+              setIssueKeys('');
+            }}
+            disabled={!selectedJiraProject}
+          >
             <option value="entire-board">Entire board</option>
+            <option value="filter">Jira saved filter</option>
+            <option value="specific-issues">Specific issues</option>
           </select>
-          <small>All issues from the selected Jira project</small>
+          <small>Choose how many issues to include in the analysis</small>
         </div>
+
+        {/* Filter selector when "filter" scope is selected */}
+        {scopeType === 'filter' && (
+          <div className="field-row">
+            <label htmlFor="ai-jira-filter">Saved Jira Filter *</label>
+            {loadingJiraFilters ? (
+              <select disabled>
+                <option>Loading filters...</option>
+              </select>
+            ) : jiraFilters.length > 0 ? (
+              <select 
+                id="ai-jira-filter" 
+                value={selectedJiraFilter} 
+                onChange={(e) => setSelectedJiraFilter(e.target.value)}
+              >
+                <option value="">Select a saved filter...</option>
+                {jiraFilters.map(filter => (
+                  <option key={filter.id} value={filter.id}>
+                    {filter.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <select disabled>
+                <option>No saved filters available</option>
+              </select>
+            )}
+            <small>Select a Jira filter to define which issues to analyze</small>
+          </div>
+        )}
+
+        {/* Issue keys input when "specific-issues" scope is selected */}
+        {scopeType === 'specific-issues' && (
+          <div className="field-row">
+            <label htmlFor="ai-issue-keys">🔥 Issue Keys * (comma-separated)</label>
+            <input 
+              id="ai-issue-keys" 
+              value={issueKeys} 
+              onChange={(e) => setIssueKeys(e.target.value)} 
+              placeholder="e.g. PROJ-101, PROJ-102, PROJ-103" 
+            />
+            <small>Enter specific issue keys to analyze</small>
+          </div>
+        )}
       </div>
 
       {/* TARGET SECTION */}
@@ -186,7 +289,7 @@ export default function AIMigrationTab() {
       <div className="info-box">
         <span className="info-icon">ℹ️</span>
         <div>
-          <strong>What AI will analyze</strong>
+          <strong>✨ What AI will analyze</strong>
           <ul>
             <li>Issue types and field mappings</li>
             <li>User and status compatibility</li>
@@ -200,7 +303,7 @@ export default function AIMigrationTab() {
       <button 
         type="button" 
         className="primary" 
-        disabled={!canAnalyze} 
+        disabled={!canAnalyze()} 
         onClick={handleAnalyze}
       >
         {isAnalyzing ? '🔄 Analyzing…' : '✨ Analyze & Plan Migration'}

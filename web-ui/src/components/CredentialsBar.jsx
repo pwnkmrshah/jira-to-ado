@@ -38,13 +38,26 @@ export default function CredentialsBar({ onSaved }) {
     saveCreds(currentCreds());
     setTestStatus('testing');
     try {
-      // Test with provided ADO credentials
-      await api.adoProjectsWithCreds(adoOrg.trim(), adoPat.trim());
+      // Test Jira credentials
+      const jiraTest = await fetch(`${apiBaseUrl.trim()}/jira-projects?jira_url=${encodeURIComponent(jiraUrl.trim())}&jira_email=${encodeURIComponent(jiraEmail.trim())}&jira_token=${encodeURIComponent(jiraToken.trim())}`, {
+        headers: { 'X-API-Key': apiKey.trim() },
+      }).then(r => r.json());
+      
+      if (jiraTest.error) {
+        throw new Error(`Jira: ${jiraTest.error}`);
+      }
+
+      // Test ADO credentials
+      const adoTest = await api.adoProjectsWithCreds(adoOrg.trim(), adoPat.trim());
+      if (adoTest.error) {
+        throw new Error(`ADO: ${adoTest.error}`);
+      }
+
       setTestStatus('ok');
-      setTestMsg('✅ Backend reachable and all credentials accepted.');
+      setTestMsg('✅ Backend reachable and all credentials accepted (Jira & ADO).');
     } catch (err) {
       setTestStatus('fail');
-      setTestMsg(err.message);
+      setTestMsg(err.message || 'Connection test failed');
     }
   };
 
