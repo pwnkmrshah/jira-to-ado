@@ -511,13 +511,24 @@ def ado_boards():
 @require_api_key
 def ado_projects():
     """
-    Return all Azure DevOps projects for the configured organisation.
-    Reads ADO_ORG and ADO_PAT from environment; falls back to config/ado_config.json.
+    Return all Azure DevOps projects for the given organisation and PAT.
+    Query params:
+      - ado_org: ADO organization (optional, falls back to env/config)
+      - ado_pat: ADO personal access token (optional, falls back to env/config)
+    
+    If ado_org and ado_pat are provided in query params, they are tested.
+    Otherwise falls back to environment variables and config file.
     """
     import requests as req
 
-    ado_org = os.environ.get('ADO_ORG', '')
-    ado_pat = os.environ.get('ADO_PAT', '')
+    ado_org = request.args.get('ado_org', '').strip()
+    ado_pat = request.args.get('ado_pat', '').strip()
+
+    # Fall back to environment variables
+    if not ado_org:
+        ado_org = os.environ.get('ADO_ORG', '')
+    if not ado_pat:
+        ado_pat = os.environ.get('ADO_PAT', '')
 
     # Fall back to config file when env vars are absent
     if not ado_org or not ado_pat:
@@ -531,7 +542,7 @@ def ado_projects():
                 ado_pat = config.get('access_token', '')
 
     if not ado_org or not ado_pat:
-        return jsonify({'error': 'ADO_ORG and ADO_PAT must be set (env or config/ado_config.json)'}), 500
+        return jsonify({'error': 'ADO_ORG and ADO_PAT must be provided (as query params or env/config)'}), 400
 
     credentials = base64.b64encode(f':{ado_pat}'.encode()).decode()
     headers = {
@@ -542,6 +553,10 @@ def ado_projects():
     url = f'https://dev.azure.com/{ado_org}/_apis/projects?api-version=7.0&$top=200'
     try:
         resp = req.get(url, headers=headers, timeout=10)
+        if resp.status_code == 401:
+            return jsonify({'error': 'ADO authentication failed. Check your organization and PAT.'}), 401
+        if resp.status_code == 403:
+            return jsonify({'error': 'ADO access denied. Check your permissions.'}), 403
         resp.raise_for_status()
         data = resp.json()
         projects = [
@@ -550,8 +565,8 @@ def ado_projects():
         ]
         return jsonify({'projects': projects})
     except Exception as exc:
-        logging.error(f'ADO projects fetch failed: {exc}')
-        return jsonify({'error': str(exc)}), 500
+        logging.error(f'ADO projects fetch failed for org "{ado_org}": {exc}')
+        return jsonify({'error': f'Could not fetch ADO projects: {str(exc)}'}), 500
 
 
 @app.route('/jira-projects', methods=['GET'])
@@ -599,6 +614,52 @@ def jira_projects():
         return jsonify({'projects': projects})
     except Exception as exc:
         logging.error(f'Jira projects fetch failed: {exc}')
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/jira-filters', methods=['GET'])
+@require_api_key
+def jira_filters():
+    """
+    Return all Jira filters accessible to the authenticated user.
+    """
+    import requests as req
+
+    jira_url = request.args.get('jira_url', '').strip()
+    jira_email = request.args.get('jira_email', '').strip()
+    jira_token = request.args.get('jira_token', '').strip()
+
+    if not jira_url or not jira_email or not jira_token:
+        config_path = REPO_ROOT / 'config' / 'jira_config.json'
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if not jira_url:
+                jira_url = config.get('url', '')
+            if not jira_email:
+                jira_email = config.get('email', '')
+            if not jira_token:
+                jira_token = config.get('token', '')
+
+    if not jira_url or not jira_email or not jira_token:
+        return jsonify({'error': 'Jira credentials not provided or configured'}), 400
+
+    auth = (jira_email, jira_token)
+    try:
+        # Fetch user's filters from Jira
+        resp = req.get(
+            f'{jira_url.rstrip("/")}/rest/api/3/filter/search?maxResults=100',
+            auth=auth,
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        filters = [
+            {'id': f['id'], 'name': f['name']}
+            for f in data.get('values', [])
+        ]
+        return jsonify({'filters': filters})
+    except Exception as exc:
+        logging.error(f'Jira filters fetch failed: {exc}')
         return jsonify({'error': str(exc)}), 500
 
 

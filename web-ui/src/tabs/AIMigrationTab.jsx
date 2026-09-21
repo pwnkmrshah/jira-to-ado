@@ -45,7 +45,7 @@ export default function AIMigrationTab() {
     const fetchAdoProjects = async () => {
       setLoadingAdoProjects(true);
       try {
-        const result = await api.adoProjects();
+        const result = await api.adoProjectsWithCreds(creds.adoOrg, creds.adoPat);
         setAdoProjects(result.projects || []);
       } catch (err) {
         console.error('Failed to fetch ADO projects:', err);
@@ -67,6 +67,7 @@ export default function AIMigrationTab() {
       const result = await api.analyze({
         jira_project_key: selectedJiraProject,
         ado_project: selectedAdoProject,
+        ado_org: creds.adoOrg,
         status_filter: statusFilter.trim() ? statusFilter.split(',').map(s => s.trim()) : [],
         field_filter: fieldFilter.trim() ? fieldFilter.split(',').map(s => s.trim()) : [],
       });

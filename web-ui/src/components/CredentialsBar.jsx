@@ -8,6 +8,7 @@ export default function CredentialsBar({ onSaved }) {
   const [jiraUrl, setJiraUrl] = useState(initial.jiraUrl || '');
   const [jiraEmail, setJiraEmail] = useState(initial.jiraEmail || '');
   const [jiraToken, setJiraToken] = useState(initial.jiraToken || '');
+  const [adoOrg, setAdoOrg] = useState(initial.adoOrg || '');
   const [adoPat, setAdoPat] = useState(initial.adoPat || '');
   const [adoProject, setAdoProject] = useState(initial.adoProject || '');
   const [testStatus, setTestStatus] = useState('idle'); // idle | testing | ok | fail
@@ -22,6 +23,7 @@ export default function CredentialsBar({ onSaved }) {
     jiraUrl: jiraUrl.trim(),
     jiraEmail: jiraEmail.trim(),
     jiraToken: jiraToken.trim(),
+    adoOrg: adoOrg.trim(),
     adoPat: adoPat.trim(),
     adoProject: adoProject.trim(),
   });
@@ -36,9 +38,10 @@ export default function CredentialsBar({ onSaved }) {
     saveCreds(currentCreds());
     setTestStatus('testing');
     try {
-      await api.adoProjects();
+      // Test with provided ADO credentials
+      await api.adoProjectsWithCreds(adoOrg.trim(), adoPat.trim());
       setTestStatus('ok');
-      setTestMsg('Backend reachable and API key accepted.');
+      setTestMsg('✅ Backend reachable and all credentials accepted.');
     } catch (err) {
       setTestStatus('fail');
       setTestMsg(err.message);
@@ -52,6 +55,7 @@ export default function CredentialsBar({ onSaved }) {
     setJiraUrl('');
     setJiraEmail('');
     setJiraToken('');
+    setAdoOrg('');
     setAdoPat('');
     setAdoProject('');
     setTestStatus('idle');
@@ -96,6 +100,10 @@ export default function CredentialsBar({ onSaved }) {
         <label>
           Jira API token
           <input type="password" value={jiraToken} onChange={(e) => setJiraToken(e.target.value)} placeholder="ATATT3x..." />
+        </label>
+        <label>
+          Azure DevOps Organization
+          <input value={adoOrg} onChange={(e) => setAdoOrg(e.target.value)} placeholder="your-org-name" />
         </label>
         <label>
           Azure DevOps PAT
