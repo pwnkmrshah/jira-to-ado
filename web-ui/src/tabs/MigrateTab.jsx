@@ -32,6 +32,7 @@ export default function MigrateTab() {
   return (
     <section className="tab-panel">
       <h2>Manual Migration</h2>
+      <p className="hint">Migrate specific Jira issues using a filter ID or individual keys.</p>
       <div className="field-row">
         <label htmlFor="migrate-mode">Source</label>
         <select id="migrate-mode" value={mode} onChange={(e) => setMode(e.target.value)}>

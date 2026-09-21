@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import CredentialsBar from './components/CredentialsBar.jsx';
+import AIMigrationTab from './tabs/AIMigrationTab.jsx';
 import MigrateTab from './tabs/MigrateTab.jsx';
 import GapAnalysisTab from './tabs/GapAnalysisTab.jsx';
 import VerifyTab from './tabs/VerifyTab.jsx';
 import { loadCreds } from './lib/api.js';
 
 const TABS = [
-  { id: 'migrate', label: 'Migrate' },
+  { id: 'ai-migrate', label: 'AI Migration' },
+  { id: 'migrate', label: 'Manual Migration' },
   { id: 'gaps', label: 'Gap Analysis' },
   { id: 'verify', label: 'Verify Migration' },
 ];
@@ -41,6 +43,7 @@ export default function App() {
             ))}
           </nav>
           <main>
+            {activeTab === 'ai-migrate' && <AIMigrationTab key={credsVersion} />}
             {activeTab === 'migrate' && <MigrateTab key={credsVersion} />}
             {activeTab === 'gaps' && <GapAnalysisTab key={credsVersion} />}
             {activeTab === 'verify' && <VerifyTab key={credsVersion} />}
