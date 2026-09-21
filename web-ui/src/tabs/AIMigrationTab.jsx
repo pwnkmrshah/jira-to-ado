@@ -20,8 +20,6 @@ export default function AIMigrationTab() {
   // Scope and optional inputs
   const [scopeType, setScopeType] = useState('entire-board'); // entire-board, filter, specific-issues
   const [issueKeys, setIssueKeys] = useState(''); // For specific issues
-  const [statusFilter, setStatusFilter] = useState('');
-  const [fieldFilter, setFieldFilter] = useState('');
   
   // Analysis state
   const [analysisResult, setAnalysisResult] = useState(null);
@@ -83,15 +81,13 @@ export default function AIMigrationTab() {
     try {
       // Build analysis payload based on scope type
       const payload = {
+        jira_project_key: selectedJiraProject, // ALWAYS required
         ado_project: selectedAdoProject,
         ado_org: creds.adoOrg,
-        status_filter: statusFilter.trim() ? statusFilter.split(',').map(s => s.trim()) : [],
-        field_filter: fieldFilter.trim() ? fieldFilter.split(',').map(s => s.trim()) : [],
       };
 
-      if (scopeType === 'entire-board') {
-        payload.jira_project_key = selectedJiraProject;
-      } else if (scopeType === 'filter') {
+      // Add optional scope parameters
+      if (scopeType === 'filter') {
         payload.jira_filter_id = filterId.trim();
       } else if (scopeType === 'specific-issues') {
         payload.jira_keys = issueKeys.split(',').map(k => k.trim());
@@ -219,32 +215,6 @@ export default function AIMigrationTab() {
             </select>
           )}
           <small>Select the target Azure DevOps project</small>
-        </div>
-      </div>
-
-      {/* OPTIONAL FILTERS */}
-      <div className="form-section">
-        <h3>OPTIONAL FILTERS</h3>
-        <div className="field-row">
-          <label htmlFor="ai-status-filter">Status Filter (comma-separated)</label>
-          <input 
-            id="ai-status-filter" 
-            value={statusFilter} 
-            onChange={(e) => setStatusFilter(e.target.value)} 
-            placeholder="e.g. Open, In Progress, Done" 
-          />
-          <small>Leave empty to include all statuses</small>
-        </div>
-
-        <div className="field-row">
-          <label htmlFor="ai-field-filter">Field Filter (comma-separated)</label>
-          <input 
-            id="ai-field-filter" 
-            value={fieldFilter} 
-            onChange={(e) => setFieldFilter(e.target.value)} 
-            placeholder="e.g. labels, components" 
-          />
-          <small>Leave empty to include all fields</small>
         </div>
       </div>
 
