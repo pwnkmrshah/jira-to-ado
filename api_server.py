@@ -554,6 +554,54 @@ def ado_projects():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/jira-projects', methods=['GET'])
+@require_api_key
+def jira_projects():
+    """
+    Return all Jira projects accessible to the authenticated user.
+    Uses credentials from the request or forwarded from Forge.
+    """
+    import requests as req
+
+    jira_url = request.args.get('jira_url', '').strip()
+    jira_email = request.args.get('jira_email', '').strip()
+    jira_token = request.args.get('jira_token', '').strip()
+
+    # Fall back to saved config if not provided
+    if not jira_url or not jira_email or not jira_token:
+        config_path = REPO_ROOT / 'config' / 'jira_config.json'
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            if not jira_url:
+                jira_url = config.get('url', '')
+            if not jira_email:
+                jira_email = config.get('email', '')
+            if not jira_token:
+                jira_token = config.get('token', '')
+
+    if not jira_url or not jira_email or not jira_token:
+        return jsonify({'error': 'Jira credentials not provided or configured (url, email, token)'}), 400
+
+    auth = (jira_email, jira_token)
+    try:
+        # Fetch all projects from Jira
+        resp = req.get(
+            f'{jira_url.rstrip("/")}/rest/api/3/project/search?maxResults=100',
+            auth=auth,
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        projects = [
+            {'key': p['key'], 'name': p['name'], 'id': p['id']}
+            for p in data.get('values', [])
+        ]
+        return jsonify({'projects': projects})
+    except Exception as exc:
+        logging.error(f'Jira projects fetch failed: {exc}')
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/preflight', methods=['GET'])
 @require_api_key
 def preflight():
