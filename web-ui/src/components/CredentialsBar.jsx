@@ -14,8 +14,11 @@ export default function CredentialsBar({ onSaved }) {
   const [testStatus, setTestStatus] = useState('idle'); // idle | testing | ok | fail
   const [testMsg, setTestMsg] = useState('');
   const [expanded, setExpanded] = useState(!initial.apiKey);
+  const [testPassed, setTestPassed] = useState(!!initial.apiKey); // Track if validation succeeded
 
   const canSave = apiKey.trim() && jiraUrl.trim() && jiraEmail.trim() && jiraToken.trim();
+  const canTest = canSave && testStatus !== 'testing';
+  const canClickSave = testPassed && canSave; // Only allow save AFTER test passes
 
   const currentCreds = () => ({
     apiBaseUrl: apiBaseUrl.trim(),
@@ -34,29 +37,50 @@ export default function CredentialsBar({ onSaved }) {
     onSaved?.();
   };
 
+  // Reset validation state when any credential changes
+  const handleCredChange = (setter) => (e) => {
+    setter(e.target.value);
+    setTestPassed(false);
+    setTestStatus('idle');
+  };
+
   const handleTest = async () => {
-    saveCreds(currentCreds());
     setTestStatus('testing');
+    setTestPassed(false);
     try {
-      // Test Jira credentials
-      const jiraTest = await fetch(`${apiBaseUrl.trim()}/jira-projects?jira_url=${encodeURIComponent(jiraUrl.trim())}&jira_email=${encodeURIComponent(jiraEmail.trim())}&jira_token=${encodeURIComponent(jiraToken.trim())}`, {
-        headers: { 'X-API-Key': apiKey.trim() },
-      }).then(r => r.json());
+      // Test Jira credentials using strict validation endpoint
+      const jiraResp = await fetch(
+        `${apiBaseUrl.trim()}/validate-jira-creds?jira_url=${encodeURIComponent(jiraUrl.trim())}&jira_email=${encodeURIComponent(jiraEmail.trim())}&jira_token=${encodeURIComponent(jiraToken.trim())}`,
+        {
+          headers: { 'X-API-Key': apiKey.trim() },
+        }
+      );
+      const jiraTest = await jiraResp.json();
       
-      if (jiraTest.error) {
-        throw new Error(`Jira: ${jiraTest.error}`);
+      if (!jiraResp.ok || jiraTest.error) {
+        throw new Error(`Jira: ${jiraTest.error || 'Validation failed'}`);
       }
 
-      // Test ADO credentials
-      const adoTest = await api.adoProjectsWithCreds(adoOrg.trim(), adoPat.trim());
-      if (adoTest.error) {
-        throw new Error(`ADO: ${adoTest.error}`);
+      // Test ADO credentials using strict validation endpoint
+      const adoResp = await fetch(
+        `${apiBaseUrl.trim()}/validate-ado-creds?ado_org=${encodeURIComponent(adoOrg.trim())}&ado_pat=${encodeURIComponent(adoPat.trim())}`,
+        {
+          headers: { 'X-API-Key': apiKey.trim() },
+        }
+      );
+      const adoTest = await adoResp.json();
+      
+      if (!adoResp.ok || adoTest.error) {
+        throw new Error(`ADO: ${adoTest.error || 'Validation failed'}`);
       }
 
+      // Both tests passed!
       setTestStatus('ok');
-      setTestMsg('✅ Backend reachable and all credentials accepted (Jira & ADO).');
+      setTestPassed(true);
+      setTestMsg('✅ Jira & Azure DevOps credentials validated successfully.');
     } catch (err) {
       setTestStatus('fail');
+      setTestPassed(false);
       setTestMsg(err.message || 'Connection test failed');
     }
   };
@@ -96,31 +120,31 @@ export default function CredentialsBar({ onSaved }) {
       <div className="creds-grid">
         <label>
           Backend API base URL
-          <input value={apiBaseUrl} onChange={(e) => setApiBaseUrl(e.target.value)} placeholder="https://jira-to-ado.onrender.com" />
+          <input value={apiBaseUrl} onChange={handleCredChange(setApiBaseUrl)} placeholder="https://jira-to-ado.onrender.com" />
         </label>
         <label>
           Backend API key
-          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="X-API-Key" />
+          <input type="password" value={apiKey} onChange={handleCredChange(setApiKey)} placeholder="X-API-Key" />
         </label>
         <label>
           Jira URL
-          <input value={jiraUrl} onChange={(e) => setJiraUrl(e.target.value)} placeholder="https://yourcompany.atlassian.net" />
+          <input value={jiraUrl} onChange={handleCredChange(setJiraUrl)} placeholder="https://yourcompany.atlassian.net" />
         </label>
         <label>
           Jira email
-          <input value={jiraEmail} onChange={(e) => setJiraEmail(e.target.value)} placeholder="you@company.com" />
+          <input value={jiraEmail} onChange={handleCredChange(setJiraEmail)} placeholder="you@company.com" />
         </label>
         <label>
           Jira API token
-          <input type="password" value={jiraToken} onChange={(e) => setJiraToken(e.target.value)} placeholder="ATATT3x..." />
+          <input type="password" value={jiraToken} onChange={handleCredChange(setJiraToken)} placeholder="ATATT3x..." />
         </label>
         <label>
           Azure DevOps Organization
-          <input value={adoOrg} onChange={(e) => setAdoOrg(e.target.value)} placeholder="your-org-name" />
+          <input value={adoOrg} onChange={handleCredChange(setAdoOrg)} placeholder="your-org-name" />
         </label>
         <label>
           Azure DevOps PAT
-          <input type="password" value={adoPat} onChange={(e) => setAdoPat(e.target.value)} placeholder="Personal Access Token" />
+          <input type="password" value={adoPat} onChange={handleCredChange(setAdoPat)} placeholder="Personal Access Token" />
         </label>
         <label>
           Default ADO project
@@ -128,14 +152,15 @@ export default function CredentialsBar({ onSaved }) {
         </label>
       </div>
       <div className="creds-actions">
-        <button type="button" onClick={handleTest} disabled={!canSave || testStatus === 'testing'}>
+        <button type="button" onClick={handleTest} disabled={!canTest}>
           {testStatus === 'testing' ? 'Testing…' : 'Test connection'}
         </button>
-        <button type="button" className="primary" onClick={handleSave} disabled={!canSave}>Save</button>
+        <button type="button" className="primary" onClick={handleSave} disabled={!canClickSave} title={!testPassed ? '⚠️ Test connection first' : ''}>Save</button>
         <button type="button" className="subtle" onClick={handleClear}>Clear</button>
       </div>
       {testStatus === 'ok' && <p className="status-ok">✅ {testMsg}</p>}
       {testStatus === 'fail' && <p className="status-fail">❌ {testMsg}</p>}
+      {testStatus === 'idle' && testPassed && <p className="status-ok">✅ Credentials validated. Ready to save.</p>}
     </div>
   );
 }

@@ -454,6 +454,102 @@ def health():
     })
 
 
+@app.route('/validate-jira-creds', methods=['GET'])
+@require_api_key
+def validate_jira_creds():
+    """
+    STRICT validation for Jira credentials — NEVER falls back to config/env.
+    Requires ALL three params explicitly. Used by frontend for credential testing.
+    Query params (ALL REQUIRED):
+      - jira_url: Full Jira instance URL (e.g., https://company.atlassian.net)
+      - jira_email: Jira account email
+      - jira_token: Jira API token
+    Returns: {'valid': true} or {'error': 'reason'}
+    """
+    import requests as req
+
+    jira_url = request.args.get('jira_url', '').strip()
+    jira_email = request.args.get('jira_email', '').strip()
+    jira_token = request.args.get('jira_token', '').strip()
+
+    # Strict validation — ALL three required, NO fallback to config/env
+    if not jira_url:
+        return jsonify({'error': 'jira_url is required'}), 400
+    if not jira_email:
+        return jsonify({'error': 'jira_email is required'}), 400
+    if not jira_token:
+        return jsonify({'error': 'jira_token is required'}), 400
+
+    auth = (jira_email, jira_token)
+    try:
+        resp = req.get(
+            f'{jira_url.rstrip("/")}/rest/api/3/project/search?maxResults=1',
+            auth=auth,
+            timeout=10
+        )
+        if resp.status_code == 401:
+            return jsonify({'error': 'Jira authentication failed. Check your email and API token.'}), 401
+        if resp.status_code == 403:
+            return jsonify({'error': 'Jira access denied. Check your account permissions.'}), 403
+        if resp.status_code == 404:
+            return jsonify({'error': 'Jira URL not found. Check your Jira instance URL.'}), 404
+        resp.raise_for_status()
+        return jsonify({'valid': True, 'message': 'Jira credentials validated successfully'})
+    except Exception as exc:
+        logging.error(f'Jira validation failed: {exc}')
+        error_str = str(exc).lower()
+        if 'connection' in error_str or 'timeout' in error_str:
+            return jsonify({'error': f'Could not reach Jira at {jira_url}. Check the URL and your internet connection.'}), 500
+        return jsonify({'error': f'Jira validation failed: {str(exc)}'}), 500
+
+
+@app.route('/validate-ado-creds', methods=['GET'])
+@require_api_key
+def validate_ado_creds():
+    """
+    STRICT validation for ADO credentials — NEVER falls back to config/env.
+    Requires BOTH params explicitly. Used by frontend for credential testing.
+    Query params (ALL REQUIRED):
+      - ado_org: ADO organization name
+      - ado_pat: ADO personal access token
+    Returns: {'valid': true} or {'error': 'reason'}
+    """
+    import requests as req
+
+    ado_org = request.args.get('ado_org', '').strip()
+    ado_pat = request.args.get('ado_pat', '').strip()
+
+    # Strict validation — BOTH required, NO fallback to config/env
+    if not ado_org:
+        return jsonify({'error': 'ado_org is required'}), 400
+    if not ado_pat:
+        return jsonify({'error': 'ado_pat is required'}), 400
+
+    credentials = base64.b64encode(f':{ado_pat}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {credentials}',
+        'Content-Type': 'application/json',
+    }
+
+    url = f'https://dev.azure.com/{ado_org}/_apis/projects?api-version=7.0&$top=1'
+    try:
+        resp = req.get(url, headers=headers, timeout=10)
+        if resp.status_code == 401:
+            return jsonify({'error': 'ADO authentication failed. Check your PAT.'}), 401
+        if resp.status_code == 403:
+            return jsonify({'error': 'ADO access denied. Check your permissions.'}), 403
+        if resp.status_code == 404:
+            return jsonify({'error': 'ADO organization not found. Check your organization name.'}), 404
+        resp.raise_for_status()
+        return jsonify({'valid': True, 'message': 'ADO credentials validated successfully'})
+    except Exception as exc:
+        logging.error(f'ADO validation failed: {exc}')
+        error_str = str(exc).lower()
+        if 'connection' in error_str or 'timeout' in error_str:
+            return jsonify({'error': 'Could not reach Azure DevOps. Check your internet connection.'}), 500
+        return jsonify({'error': f'ADO validation failed: {str(exc)}'}), 500
+
+
 @app.route('/ado-boards', methods=['GET'])
 @require_api_key
 def ado_boards():
