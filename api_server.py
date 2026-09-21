@@ -29,6 +29,34 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+# Standalone web-ui calls this API directly from the browser (unlike Forge,
+# whose resolvers call it server-to-server), so CORS headers are required.
+# Restrict via CORS_ALLOWED_ORIGINS="https://foo.com,https://bar.com" in prod;
+# defaults to reflecting the request Origin (safe here since auth is via the
+# X-API-Key header, not cookies, so it isn't forgeable cross-site).
+_CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', '*')
+
+
+@app.after_request
+def _add_cors_headers(response):
+    if _CORS_ALLOWED_ORIGINS == '*':
+        # Allow all origins in development/demo mode
+        origin = request.headers.get('Origin', '*')
+        response.headers['Access-Control-Allow-Origin'] = origin if origin else '*'
+        if request.headers.get('Origin'):
+            response.headers['Vary'] = 'Origin'
+    else:
+        # Restrict to specific origins in production
+        origin = request.headers.get('Origin', '')
+        if origin and origin in _CORS_ALLOWED_ORIGINS.split(','):
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Vary'] = 'Origin'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
