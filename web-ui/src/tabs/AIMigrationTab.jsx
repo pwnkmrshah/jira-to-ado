@@ -93,10 +93,18 @@ export default function AIMigrationTab() {
         payload.jira_keys = issueKeys.split(',').map(k => k.trim());
       }
 
+      console.log('[ANALYZE] Sending payload:', payload);
       const result = await api.analyze(payload);
+      console.log('[ANALYZE] Response received:', result);
+      
+      if (!result) {
+        throw new Error('Empty response from analysis');
+      }
+      
       setAnalysisResult(result);
     } catch (err) {
-      setAnalysisError(err.message);
+      console.error('[ANALYZE] Error:', err);
+      setAnalysisError(err.message || 'Analysis failed');
     } finally {
       setIsAnalyzing(false);
     }
@@ -248,18 +256,21 @@ export default function AIMigrationTab() {
       {analysisResult && (
         <div className="analysis-results">
           <h3>📊 Analysis Results</h3>
-          <div className="result-grid">
-            <div className="result-item">
-              <label>Total Issues</label>
-              <span className="big-number">{analysisResult.total_issues}</span>
-            </div>
-            {analysisResult.by_type && Object.entries(analysisResult.by_type).map(([type, count]) => (
-              <div key={type} className="result-item">
-                <label>{type}</label>
-                <span>{count}</span>
+          
+          {analysisResult.total_issues !== undefined && (
+            <div className="result-grid">
+              <div className="result-item">
+                <label>Total Issues</label>
+                <span className="big-number">{analysisResult.total_issues}</span>
               </div>
-            ))}
-          </div>
+              {analysisResult.by_type && typeof analysisResult.by_type === 'object' && Object.entries(analysisResult.by_type).map(([type, count]) => (
+                <div key={`type-${type}`} className="result-item">
+                  <label>{type}</label>
+                  <span>{count}</span>
+                </div>
+              ))}
+            </div>
+          )}
 
           {analysisResult.attachment_count !== undefined && (
             <p>📎 Attachments: <strong>{analysisResult.attachment_count}</strong></p>
@@ -269,25 +280,25 @@ export default function AIMigrationTab() {
             <p>💬 Comments: <strong>{analysisResult.comment_count}</strong></p>
           )}
 
-          {analysisResult.type_gaps && Object.keys(analysisResult.type_gaps).length > 0 && (
+          {analysisResult.type_gaps && typeof analysisResult.type_gaps === 'object' && Object.keys(analysisResult.type_gaps).length > 0 && (
             <div className="gaps-section warning">
               <h4>⚠️ Type Gaps</h4>
               <p>Jira issue types that need mapping to ADO:</p>
               <ul>
                 {Object.entries(analysisResult.type_gaps).map(([jiraType, adoMapping]) => (
-                  <li key={jiraType}><strong>{jiraType}</strong> → {adoMapping || '❌ No mapping'}</li>
+                  <li key={`gap-${jiraType}`}><strong>{jiraType}</strong> → {adoMapping || '❌ No mapping'}</li>
                 ))}
               </ul>
             </div>
           )}
 
-          {analysisResult.user_gaps && Object.keys(analysisResult.user_gaps).length > 0 && (
+          {analysisResult.user_gaps && typeof analysisResult.user_gaps === 'object' && Object.keys(analysisResult.user_gaps).length > 0 && (
             <div className="gaps-section warning">
               <h4>⚠️ User Gaps</h4>
               <p>Jira users that need to be added to ADO:</p>
               <ul>
                 {Object.entries(analysisResult.user_gaps).slice(0, 10).map(([jiraUser, adoMapping]) => (
-                  <li key={jiraUser}><strong>{jiraUser}</strong> → {adoMapping || '❌ Not in ADO'}</li>
+                  <li key={`user-${jiraUser}`}><strong>{jiraUser}</strong> → {adoMapping || '❌ Not in ADO'}</li>
                 ))}
                 {Object.keys(analysisResult.user_gaps).length > 10 && (
                   <li>... and {Object.keys(analysisResult.user_gaps).length - 10} more users</li>
