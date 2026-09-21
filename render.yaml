@@ -1,20 +1,15 @@
 services:
   - type: web
     name: jira-to-ado
-    runtime: python
-    pythonVersion: 3.11
+    runtime: docker
     
-    # Build commands
-    buildCommand: |
-      pip install -r requirements.txt && \
-      cd web-ui && npm install && npm run build && cd ..
-    
-    # Start command
-    startCommand: "python api_server.py"
-    
-    # Environment
+    # Environment variables (set these in Render dashboard)
     envVars:
       - key: FLASK_ENV
         value: production
       - key: PORT
         value: 10000
+      - key: MIGRATION_API_KEY
+        sync: false  # Keep as secret, don't sync from git
+      - key: CORS_ALLOWED_ORIGINS
+        value: "*"

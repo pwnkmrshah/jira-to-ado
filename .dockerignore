@@ -1,0 +1,10 @@
+web
+node_modules
+*.egg-info
+__pycache__
+.Python
+build/
+.venv/
+.DS_Store
+.env
+.env.local

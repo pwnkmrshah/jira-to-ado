@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "10000:10000"
+    environment:
+      FLASK_ENV: production
+      PORT: 10000
+      MIGRATION_API_KEY: ${MIGRATION_API_KEY:-your-secret-key}
+      CORS_ALLOWED_ORIGINS: "*"
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
