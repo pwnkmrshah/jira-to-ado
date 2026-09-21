@@ -9,10 +9,8 @@ export default function AIMigrationTab() {
   const [selectedJiraProject, setSelectedJiraProject] = useState('');
   const [loadingJiraProjects, setLoadingJiraProjects] = useState(false);
   
-  // Jira filters state (for scope)
-  const [jiraFilters, setJiraFilters] = useState([]);
-  const [selectedJiraFilter, setSelectedJiraFilter] = useState('');
-  const [loadingJiraFilters, setLoadingJiraFilters] = useState(false);
+  // Jira filter ID (manual text input, not dropdown)
+  const [filterId, setFilterId] = useState('');
   
   // ADO projects state
   const [adoProjects, setAdoProjects] = useState([]);
@@ -47,25 +45,6 @@ export default function AIMigrationTab() {
     fetchJiraProjects();
   }, []);
 
-  // Fetch Jira filters when needed
-  useEffect(() => {
-    if (scopeType === 'filter') {
-      const fetchFilters = async () => {
-        setLoadingJiraFilters(true);
-        try {
-          const result = await api.jiraFilters();
-          setJiraFilters(result.filters || []);
-        } catch (err) {
-          console.error('Failed to fetch Jira filters:', err);
-          setAnalysisError('Could not fetch Jira filters.');
-        } finally {
-          setLoadingJiraFilters(false);
-        }
-      };
-      fetchFilters();
-    }
-  }, [scopeType]);
-
   // Fetch ADO projects on mount
   useEffect(() => {
     const fetchAdoProjects = async () => {
@@ -89,7 +68,7 @@ export default function AIMigrationTab() {
     }
     // Check based on scope type
     if (scopeType === 'filter') {
-      return selectedJiraFilter && !loadingJiraFilters;
+      return filterId.trim() !== '';
     }
     if (scopeType === 'specific-issues') {
       return issueKeys.trim() !== '';
@@ -113,7 +92,7 @@ export default function AIMigrationTab() {
       if (scopeType === 'entire-board') {
         payload.jira_project_key = selectedJiraProject;
       } else if (scopeType === 'filter') {
-        payload.jira_filter_id = selectedJiraFilter;
+        payload.jira_filter_id = filterId.trim();
       } else if (scopeType === 'specific-issues') {
         payload.jira_keys = issueKeys.split(',').map(k => k.trim());
       }
@@ -173,7 +152,7 @@ export default function AIMigrationTab() {
             value={scopeType} 
             onChange={(e) => {
               setScopeType(e.target.value);
-              setSelectedJiraFilter('');
+              setFilterId('');
               setIssueKeys('');
             }}
             disabled={!selectedJiraProject}
@@ -188,30 +167,14 @@ export default function AIMigrationTab() {
         {/* Filter selector when "filter" scope is selected */}
         {scopeType === 'filter' && (
           <div className="field-row">
-            <label htmlFor="ai-jira-filter">Saved Jira Filter *</label>
-            {loadingJiraFilters ? (
-              <select disabled>
-                <option>Loading filters...</option>
-              </select>
-            ) : jiraFilters.length > 0 ? (
-              <select 
-                id="ai-jira-filter" 
-                value={selectedJiraFilter} 
-                onChange={(e) => setSelectedJiraFilter(e.target.value)}
-              >
-                <option value="">Select a saved filter...</option>
-                {jiraFilters.map(filter => (
-                  <option key={filter.id} value={filter.id}>
-                    {filter.name}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <select disabled>
-                <option>No saved filters available</option>
-              </select>
-            )}
-            <small>Select a Jira filter to define which issues to analyze</small>
+            <label htmlFor="ai-jira-filter-id">Jira Filter ID *</label>
+            <input 
+              id="ai-jira-filter-id" 
+              value={filterId} 
+              onChange={(e) => setFilterId(e.target.value)} 
+              placeholder="e.g. 10000" 
+            />
+            <small>Enter the Jira filter ID (found in filter URL: .../browse?jql=...&filterId=XXXXX)</small>
           </div>
         )}
 
