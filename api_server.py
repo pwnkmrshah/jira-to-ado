@@ -441,6 +441,19 @@ def _jira_env_from_body(body: dict) -> dict:
     return {}
 
 
+def _ado_env_from_body(body: dict) -> dict:
+    """Build ADO_ORG/ADO_PAT env overrides from UI-forwarded credentials.
+
+    Without this, subprocesses fall back to config/ado_config.json, which is
+    gitignored and doesn't exist on Render — causing load_ado_config() to return None.
+    """
+    ado_org = (body.get('ado_org') or '').strip()
+    ado_pat = (body.get('ado_pat') or '').strip()
+    if ado_org and ado_pat:
+        return {'ADO_ORG': ado_org, 'ADO_PAT': ado_pat}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -1180,6 +1193,7 @@ def gaps():
     jira_filter = body.get('jira_filter', '').strip()
     ado_board = body.get('ado_board', '').strip()
     jira_env = _jira_env_from_body(body)
+    ado_env = _ado_env_from_body(body)
 
     if not jira_filter:
         return jsonify({'error': 'jira_filter is required'}), 400
@@ -1197,7 +1211,9 @@ def gaps():
     if ado_board:
         cmd += ['--ado-board', ado_board]
 
-    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
+    # Merge Jira and ADO credential env vars
+    env_overrides = {**jira_env, **ado_env}
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=env_overrides)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 
@@ -1225,6 +1241,7 @@ def gaps_board():
     jira_board_key = body.get('jira_board_key', '').strip()
     ado_board = body.get('ado_board', '').strip()
     jira_env = _jira_env_from_body(body)
+    ado_env = _ado_env_from_body(body)
 
     if not jira_board_key:
         return jsonify({'error': 'jira_board_key is required'}), 400
@@ -1242,7 +1259,9 @@ def gaps_board():
     if ado_board:
         cmd += ['--ado-board', ado_board]
 
-    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
+    # Merge Jira and ADO credential env vars
+    env_overrides = {**jira_env, **ado_env}
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=env_overrides)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 
@@ -1269,6 +1288,7 @@ def verify():
     jira_keys = body.get('jira_keys', '').strip()
     jira_filter = body.get('jira_filter', '').strip()
     jira_env = _jira_env_from_body(body)
+    ado_env = _ado_env_from_body(body)
 
     if not project_key and not jira_keys and not jira_filter:
         return jsonify({'error': 'Provide project_key, jira_keys, or jira_filter'}), 400
@@ -1289,7 +1309,9 @@ def verify():
     if jira_filter:
         cmd += ['--jira-filter', jira_filter]
 
-    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=jira_env)
+    # Merge Jira and ADO credential env vars
+    env_overrides = {**jira_env, **ado_env}
+    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=env_overrides)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 

@@ -35,7 +35,7 @@ export default function GapAnalysisTab() {
   const { job, jobId, startError, isRunning, start } = useJob();
 
   const hasInput = mode === 'filter' ? filterId.trim() : boardKey.trim();
-  const canRun = !isRunning && adoProject.trim() && hasInput;
+  const canRun = !isRunning && adoProject.trim() && hasInput && adoBoard.trim();
 
   // Extract jira_instance from jira_url (e.g., 'https://healthfinch.atlassian.net' → 'healthfinch')
   const extractJiraInstance = (url) => {
@@ -45,6 +45,10 @@ export default function GapAnalysisTab() {
   };
 
   const handleRun = () => {
+    if (!adoBoard.trim()) {
+      alert('ADO Team/Board is required');
+      return;
+    }
     const jiraInstance = extractJiraInstance(creds.jiraUrl);
     start(() => (mode === 'filter'
       ? api.gaps({ jira_instance: jiraInstance, ado_project: adoProject.trim(), jira_filter: filterId.trim(), ado_board: adoBoard.trim() })
@@ -80,8 +84,8 @@ export default function GapAnalysisTab() {
         <input id="gap-ado-project" value={adoProject} onChange={(e) => setAdoProject(e.target.value)} placeholder="Embedded Refills Engineering" />
       </div>
       <div className="field-row">
-        <label htmlFor="gap-ado-board">ADO Team/Board (optional)</label>
-        <input id="gap-ado-board" value={adoBoard} onChange={(e) => setAdoBoard(e.target.value)} placeholder="Team name" />
+        <label htmlFor="gap-ado-board">ADO Team/Board</label>
+        <input id="gap-ado-board" value={adoBoard} onChange={(e) => setAdoBoard(e.target.value)} placeholder="Team name" required />
       </div>
       <button type="button" className="primary" disabled={!canRun} onClick={handleRun}>
         {isRunning ? 'Analyzing…' : 'Run Gap Analysis'}
