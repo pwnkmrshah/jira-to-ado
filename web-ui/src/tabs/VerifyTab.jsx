@@ -49,8 +49,17 @@ export default function VerifyTab() {
   const sourceValue = { project: projectKey, board: boardKey, keys: jiraKeys, filter: filterId }[mode];
   const canRun = !isRunning && adoProject.trim() && sourceValue.trim();
 
+  // Extract jira_instance from jira_url (e.g., 'https://healthfinch.atlassian.net' → 'healthfinch')
+  const extractJiraInstance = (url) => {
+    if (!url) return 'healthfinch'; // fallback
+    const match = url.match(/https?:\/\/([^.]+)\.atlassian\.net/);
+    return match ? match[1] : 'healthfinch';
+  };
+
   const handleRun = () => {
+    const jiraInstance = extractJiraInstance(creds.jiraUrl);
     start(() => api.verify({
+      jira_instance: jiraInstance,
       ado_project: adoProject.trim(),
       // "Entire Jira Board" reuses the existing --project-key backend path
       project_key: mode === 'project' || mode === 'board' ? (mode === 'project' ? projectKey.trim() : boardKey.trim()) : '',

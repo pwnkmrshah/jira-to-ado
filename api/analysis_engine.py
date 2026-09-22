@@ -165,17 +165,89 @@ def _fetch_ado_states(ado_org: str, ado_project: str, ado_pat: str, work_item_ty
     return list(seen.keys())
 
 
-def _fetch_ado_users(ado_org: str, ado_pat: str) -> set[str]:
+def _fetch_ado_users(ado_org: str, ado_project: str, ado_pat: str) -> set[str]:
     """
+    Returns a set of lowercased ADO user email addresses from work items in the project.
+    
+    Fetches work items with assignees to get actual users in the board.
+    This is more reliable than the Graph API which may have permission restrictions.
+    Falls back to Graph API if WIQL fails.
+    """
+    # First, try to get users from actual work items in the project
+    ado_users = _fetch_ado_users_from_workitems(ado_org, ado_project, ado_pat)
+    if ado_users:
+        logger.info(f"[analysis] Found {len(ado_users)} unique users in ADO project work items")
+        return ado_users
+    
+    # Fallback to Graph API if WIQL fails
+    logger.warning("[analysis] Could not fetch users from work items, falling back to Graph API")
+    return _fetch_ado_users_from_graph(ado_org, ado_pat)
+
+
+def _fetch_ado_users_from_workitems(ado_org: str, ado_project: str, ado_pat: str) -> set[str]:
+    """
+    Fetches users by querying work items with assignees in the ADO project.
+    Returns a set of lowercased email addresses of users assigned to work items.
+    """
+    # WIQL query to get work items with assignees
+    wiql_query = "SELECT [System.Id], [System.AssignedTo] FROM WorkItems WHERE [Team Project] = @project AND [System.AssignedTo] <> '' ORDER BY [System.Id]"
+    
+    url = f"https://dev.azure.com/{ado_org}/{ado_project}/_apis/wit/wiql?api-version=7.0"
+    
+    try:
+        # Execute WIQL query
+        r = requests.post(
+            url,
+            auth=("", ado_pat),
+            json={"query": wiql_query},
+            timeout=15
+        )
+        r.raise_for_status()
+        
+        workitem_refs = r.json().get("workItems", [])
+        if not workitem_refs:
+            logger.info("[analysis] No work items found in project")
+            return set()
+        
+        # Now fetch the actual work items to get assignee details
+        # Get up to 200 work items (IDs only from WIQL)
+        ids = [str(wi["id"]) for wi in workitem_refs[:200]]
+        if not ids:
+            return set()
+        
+        # Batch fetch work items with assignee info
+        ids_param = ",".join(ids)
+        details_url = f"https://dev.azure.com/{ado_org}/{ado_project}/_apis/wit/workitems?ids={ids_param}&fields=System.AssignedTo&api-version=7.0"
+        
+        r = requests.get(details_url, auth=("", ado_pat), timeout=15)
+        r.raise_for_status()
+        
+        # Extract email addresses from assignees
+        users = set()
+        for item in r.json().get("value", []):
+            assignee = item.get("fields", {}).get("System.AssignedTo", {})
+            if assignee and isinstance(assignee, dict):
+                email = assignee.get("uniqueName", "").lower()
+                if email and "@" in email:
+                    users.add(email)
+        
+        return users
+        
+    except Exception as exc:
+        logger.warning("[analysis] WIQL work item fetch failed: %s", exc)
+        return set()
+
+
+def _fetch_ado_users_from_graph(ado_org: str, ado_pat: str) -> set[str]:
+    """
+    Fallback to fetch ADO users via Graph API.
     Returns a set of lowercased ADO member email addresses.
-    Uses the VSSPS Graph API — may be empty if the PAT lacks the Graph scope;
-    that is non-fatal (user gap detection is skipped).
     """
     url = f"https://vssps.dev.azure.com/{ado_org}/_apis/graph/users?api-version=7.1-preview.1"
     try:
         r = requests.get(url, auth=("", ado_pat), timeout=12)
         if r.status_code in (403, 401):
-            logger.info("[analysis] ADO Graph API not in PAT scope — skipping user gap check")
+            logger.info("[analysis] ADO Graph API not in PAT scope — cannot verify user availability")
             return set()
         r.raise_for_status()
         return {
@@ -184,7 +256,7 @@ def _fetch_ado_users(ado_org: str, ado_pat: str) -> set[str]:
             if u.get("mailAddress")
         }
     except Exception as exc:
-        logger.warning("[analysis] ADO user fetch failed (non-fatal): %s", exc)
+        logger.warning("[analysis] ADO Graph API fetch failed: %s", exc)
         return set()
 
 
@@ -437,33 +509,59 @@ def run_analysis(
     ado_org: str,
     ado_pat: str,
     jira_project_key: str = '',
+    jira_filter_id: str = '',  # NEW: optional filter ID
+    jira_keys: list[str] | None = None,  # NEW: optional specific keys
     status_filter: list[str] | None = None,  # empty list = all statuses
     field_filter: list[str] | None = None,   # empty list = all fields
 ) -> dict:
     """
     Perform a pre-migration analysis and return a structured result dict.
+    
+    Scope can be specified by one of:
+      - jira_filter_id: Analyze issues in a specific Jira filter
+      - jira_keys: Analyze specific issue keys
+      - jira_project_key: Analyze entire project (default)
 
     Returns dict with keys:
         total_issues, by_type, by_status, ado_available_types,
         type_gaps, user_gaps, attachment_count, comment_count,
         selected_statuses, selected_fields
     """
-    if not jira_project_key:
-        return {"error": "Select a Jira board to analyze."}
+    if jira_keys is None:
+        jira_keys = []
+    
+    # Determine JQL based on scope
+    if jira_filter_id:
+        # Use Jira filter: Let Jira resolve the filter ID server-side
+        # Using 'filter = ID' in JQL is simpler and more reliable than fetching filter details
+        jql = f'filter = {jira_filter_id}'
+        scope_desc = f"filter {jira_filter_id}"
+        logger.info(f"[analysis] Using Jira filter {jira_filter_id}")
+    elif jira_keys:
+        # Use specific keys
+        quoted_keys = ', '.join(f'"{k}"' for k in jira_keys)
+        jql = f'key in ({quoted_keys})'
+        scope_desc = f"keys {jira_keys}"
+        logger.info(f"[analysis] Analyzing scope: {scope_desc}")
+    else:
+        # Use project key (default)
+        if not jira_project_key:
+            return {"error": "Select a Jira board to analyze."}
+        parts = [f'project = "{jira_project_key}"']
+        if status_filter:
+            quoted = ', '.join(f'"{s}"' for s in status_filter)
+            parts.append(f'status in ({quoted})')
+        jql = ' AND '.join(parts) + ' ORDER BY created DESC'
+        scope_desc = f"project {jira_project_key}"
+        logger.info(f"[analysis] Analyzing scope: {scope_desc}")
 
-    # 1. Build JQL from project key + selected statuses
-    parts = [f'project = "{jira_project_key}"']
-    if status_filter:
-        quoted = ', '.join(f'"{s}"' for s in status_filter)
-        parts.append(f'status in ({quoted})')
-    jql = ' AND '.join(parts) + ' ORDER BY created DESC'
     logger.info("[analysis] JQL: %s", jql)
 
     # 2. Fetch Jira issues
     issues = _fetch_issues(jira_url, jira_email, jira_token, jql)
     if not issues:
         return {
-            "error": "No issues found for the selected board/statuses. Try selecting different statuses.",
+            "error": "No issues found for the selected scope. Try selecting different filters/keys.",
             "jql_used": jql,
         }
 
@@ -492,7 +590,7 @@ def run_analysis(
 
     # 4. Fetch ADO data (run both; they're independent)
     ado_types = _fetch_ado_work_item_types(ado_org, ado_project, ado_pat)
-    ado_users = _fetch_ado_users(ado_org, ado_pat)
+    ado_users = _fetch_ado_users(ado_org, ado_project, ado_pat)
     ado_states = _fetch_ado_states(ado_org, ado_project, ado_pat, ado_types)
     type_config = _load_type_config()
     state_config = _load_state_config()

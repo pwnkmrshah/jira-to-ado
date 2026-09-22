@@ -37,10 +37,18 @@ export default function GapAnalysisTab() {
   const hasInput = mode === 'filter' ? filterId.trim() : boardKey.trim();
   const canRun = !isRunning && adoProject.trim() && hasInput;
 
+  // Extract jira_instance from jira_url (e.g., 'https://healthfinch.atlassian.net' → 'healthfinch')
+  const extractJiraInstance = (url) => {
+    if (!url) return 'healthfinch'; // fallback
+    const match = url.match(/https?:\/\/([^.]+)\.atlassian\.net/);
+    return match ? match[1] : 'healthfinch';
+  };
+
   const handleRun = () => {
+    const jiraInstance = extractJiraInstance(creds.jiraUrl);
     start(() => (mode === 'filter'
-      ? api.gaps({ ado_project: adoProject.trim(), jira_filter: filterId.trim(), ado_board: adoBoard.trim() })
-      : api.gapsBoard({ ado_project: adoProject.trim(), jira_board_key: boardKey.trim(), ado_board: adoBoard.trim() })
+      ? api.gaps({ jira_instance: jiraInstance, ado_project: adoProject.trim(), jira_filter: filterId.trim(), ado_board: adoBoard.trim() })
+      : api.gapsBoard({ jira_instance: jiraInstance, ado_project: adoProject.trim(), jira_board_key: boardKey.trim(), ado_board: adoBoard.trim() })
     ));
   };
 

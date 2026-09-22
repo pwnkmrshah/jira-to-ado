@@ -1016,10 +1016,12 @@ def migrate():
     jql = body.get('jql', '').strip()
     field_filter = [f.strip() for f in (body.get('field_filter') or []) if f.strip()]
     ado_team_name = body.get('ado_team_name', '').strip()
-    # Credentials forwarded from Forge KVS — override the worker's local jira_config.json
+    # Credentials from UI — override the worker's local config files
     jira_url   = body.get('jira_url', '').strip()
     jira_email = body.get('jira_email', '').strip()
     jira_token = body.get('jira_token', '').strip()
+    ado_org    = body.get('ado_org', '').strip()
+    ado_pat    = body.get('ado_pat', '').strip()
     # Derive the instance label from the actual URL so the command log is accurate
     if jira_url:
         from urllib.parse import urlparse as _urlparse
@@ -1058,10 +1060,15 @@ def migrate():
         cmd += ['--ado-team-name', ado_team_name]
 
     logging.info(f"MIGRATE cmd: {' '.join(cmd)}")
-    # Pass Jira credentials as env vars so worker uses them instead of local jira_config.json
-    jira_env = {}
+    # Pass credentials as env vars so worker uses them instead of config files
+    env_overrides = {}
     if jira_url and jira_email and jira_token:
-        jira_env = {'JIRA_URL': jira_url, 'JIRA_EMAIL': jira_email, 'JIRA_TOKEN': jira_token}
+        env_overrides.update({'JIRA_URL': jira_url, 'JIRA_EMAIL': jira_email, 'JIRA_TOKEN': jira_token})
+    if ado_org and ado_pat:
+        env_overrides.update({'ADO_ORG': ado_org, 'ADO_PAT': ado_pat})
+    
+    if env_overrides:
+        logging.info(f"MIGRATE passing credentials via env: jira={'yes' if 'JIRA_URL' in env_overrides else 'no'}, ado={'yes' if 'ADO_ORG' in env_overrides else 'no'}")
 
     job_id = _spawn(cmd, extra_fields={
         'jira_instance': jira_instance,
@@ -1069,8 +1076,8 @@ def migrate():
         'jira_filter': jira_filter,
         'jira_keys': jira_keys,
         'jql': jql,
-    }, env_overrides=jira_env)
-    logging.info(f"MIGRATE queued as job_id={job_id}  jira_creds_overridden={bool(jira_env)}")
+    }, env_overrides=env_overrides)
+    logging.info(f"MIGRATE queued as job_id={job_id}  jira_creds_overridden={bool('JIRA_URL' in env_overrides)}  ado_creds_overridden={bool('ADO_ORG' in env_overrides)}")
     return jsonify({'job_id': job_id, 'status': 'queued'}), 202
 
 
@@ -1296,13 +1303,17 @@ def analyze():
     """
     POST /analyze
     Body (JSON):
-        intent       — natural language or Jira filter ID or JQL
-        ado_project  — ADO project name (e.g. "Embedded Refills Engineering")
-        jira_url     — e.g. "https://acme.atlassian.net"
-        jira_email   — Jira account email
-        jira_token   — Jira API token
-        ado_org      — ADO organisation slug
-        ado_pat      — ADO personal access token
+        jira_project_key — Jira project key (e.g. "SUST")
+        jira_filter_id   — (OPTIONAL) Jira filter ID to analyze specific filter
+        jira_keys        — (OPTIONAL) List of specific issue keys to analyze
+        
+        ado_project      — ADO project name (e.g. "Embedded Refills Engineering")
+        ado_org          — ADO organisation slug
+        
+        jira_url         — Full Jira instance URL
+        jira_email       — Jira account email
+        jira_token       — Jira API token
+        ado_pat          — ADO personal access token
 
     Response 200:
         {total_issues, by_type, by_status, ado_available_types,
@@ -1316,16 +1327,24 @@ def analyze():
 
     body = request.get_json(force=True) or {}
 
+    # Required fields
     ado_project      = (body.get('ado_project') or '').strip()
     jira_project_key = (body.get('jira_project_key') or '').strip()
-    status_filter    = body.get('status_filter') or []   # list of status name strings
-    field_filter     = body.get('field_filter') or []    # list of field name strings
     jira_url         = (body.get('jira_url') or '').strip()
     jira_email       = (body.get('jira_email') or '').strip()
     jira_token       = (body.get('jira_token') or '').strip()
     ado_org          = (body.get('ado_org') or '').strip()
     ado_pat          = (body.get('ado_pat') or '').strip()
+    
+    # Optional scope parameters
+    jira_filter_id   = (body.get('jira_filter_id') or '').strip()  # Optional
+    jira_keys        = body.get('jira_keys') or []  # Optional list
+    
+    # Optional filters
+    status_filter    = body.get('status_filter') or []   # list of status name strings
+    field_filter     = body.get('field_filter') or []    # list of field name strings
 
+    # Check required fields
     missing = [f for f, v in {
         'ado_project': ado_project,
         'jira_project_key': jira_project_key,
@@ -1336,9 +1355,16 @@ def analyze():
     if missing:
         return jsonify({'error': f"Missing required fields: {', '.join(missing)}"}), 400
 
+    # Log which scope is being analyzed
+    scope_desc = f"project '{jira_project_key}'"
+    if jira_filter_id:
+        scope_desc = f"filter '{jira_filter_id}'"
+    elif jira_keys:
+        scope_desc = f"keys {jira_keys}"
+    
     logging.info(
-        f"ANALYZE project={jira_project_key!r}  statuses={status_filter}  "
-        f"ado_project={ado_project!r}  ado_org={ado_org!r}"
+        f"ANALYZE scope={scope_desc}  ado_project={ado_project!r}  "
+        f"ado_org={ado_org!r}  status_filter={status_filter}  field_filter={field_filter}"
     )
 
     result = run_analysis(
@@ -1349,6 +1375,8 @@ def analyze():
         ado_org=ado_org,
         ado_pat=ado_pat,
         jira_project_key=jira_project_key,
+        jira_filter_id=jira_filter_id,  # NEW: pass filter ID if provided
+        jira_keys=jira_keys,             # NEW: pass specific keys if provided
         status_filter=status_filter,
         field_filter=field_filter,
     )
