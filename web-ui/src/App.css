@@ -93,6 +93,11 @@ header h1 {
   margin-bottom: -2px;
 }
 
+.tab-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .tab-bar button.active {
   color: #0052cc;
   border-bottom-color: #0052cc;

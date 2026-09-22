@@ -904,24 +904,26 @@ def main():
             "checks":       {},
         })
 
-    # ✅ Write CSV if requested
+    # ✅ Write CSV if requested — ONLY failed items (not all)
     if args.csv_output and results:
         import csv as _csv
-        with open(args.csv_output, 'w', newline='') as _f:
-            w = _csv.writer(_f)
-            w.writerow(['jira_key', 'ado_id', 'migration_status', 'failed_checks', 'details'])
-            for r in results:
-                if not r['found_in_ado']:
-                    status, failed, details = 'not_found', '', 'Item not found in ADO'
-                elif r['all_pass']:
-                    status, failed, details = 'verified', '', ''
-                else:
-                    failed_items = [(n, c) for n, c in r['checks'].items() if not c['pass']]
-                    status = 'warnings'
-                    failed = ' | '.join(n for n, _ in failed_items)
-                    details = ' | '.join(c['note'] for _, c in failed_items if c.get('note'))
-                w.writerow([r['jira_key'], r.get('ado_id', ''), status, failed, details])
-        logging.info(f'CSV written to {args.csv_output} ({len(results)} rows)')
+        failed_results = [r for r in results if not r['all_pass'] or not r['found_in_ado']]
+        if failed_results:
+            with open(args.csv_output, 'w', newline='') as _f:
+                w = _csv.writer(_f)
+                w.writerow(['jira_key', 'ado_id', 'migration_status', 'failed_checks', 'details'])
+                for r in failed_results:
+                    if not r['found_in_ado']:
+                        status, failed, details = 'not_found', '', 'Item not found in ADO'
+                    else:
+                        failed_items = [(n, c) for n, c in r['checks'].items() if not c['pass']]
+                        status = 'warnings'
+                        failed = ' | '.join(n for n, _ in failed_items)
+                        details = ' | '.join(c['note'] for _, c in failed_items if c.get('note'))
+                    w.writerow([r['jira_key'], r.get('ado_id', ''), status, failed, details])
+            logging.info(f'CSV written to {args.csv_output} ({len(failed_results)} failed rows)')
+        else:
+            logging.info(f'CSV not written — all items passed verification')
 
     # ✅ Summary
     total = len(results)

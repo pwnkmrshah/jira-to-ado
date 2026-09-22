@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { api, loadCreds } from '../lib/api.js';
 import { useJob } from '../hooks/useJob.js';
 import JobStatusPanel from '../components/JobStatusPanel.jsx';
@@ -36,7 +36,7 @@ function parseSummary(output) {
   return { total, found, missing, failures, passRate };
 }
 
-export default function VerifyTab() {
+export default function VerifyTab({ onJobStart, onJobEnd }) {
   const creds = loadCreds();
   const [mode, setMode] = useState('project');
   const [projectKey, setProjectKey] = useState('');
@@ -45,6 +45,15 @@ export default function VerifyTab() {
   const [filterId, setFilterId] = useState('');
   const [adoProject, setAdoProject] = useState(creds.adoProject || '');
   const { job, jobId, startError, isRunning, start } = useJob();
+
+  // Notify parent when job status changes
+  useEffect(() => {
+    if (isRunning) {
+      onJobStart?.('verify');
+    } else if (jobId && job && TERMINAL.has(job.status)) {
+      onJobEnd?.();
+    }
+  }, [isRunning, jobId, job, onJobStart, onJobEnd]);
 
   const sourceValue = { project: projectKey, board: boardKey, keys: jiraKeys, filter: filterId }[mode];
   const canRun = !isRunning && adoProject.trim() && sourceValue.trim();

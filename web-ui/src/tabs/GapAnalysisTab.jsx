@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { api, loadCreds } from '../lib/api.js';
 import { useJob } from '../hooks/useJob.js';
 import JobStatusPanel from '../components/JobStatusPanel.jsx';
@@ -25,7 +25,7 @@ function parseGapCounts(output) {
   };
 }
 
-export default function GapAnalysisTab() {
+export default function GapAnalysisTab({ onJobStart, onJobEnd }) {
   const creds = loadCreds();
   const [mode, setMode] = useState('filter'); // filter | board
   const [filterId, setFilterId] = useState('');
@@ -33,6 +33,15 @@ export default function GapAnalysisTab() {
   const [adoProject, setAdoProject] = useState(creds.adoProject || '');
   const [adoBoard, setAdoBoard] = useState('');
   const { job, jobId, startError, isRunning, start } = useJob();
+
+  // Notify parent when job status changes
+  useEffect(() => {
+    if (isRunning) {
+      onJobStart?.('gaps');
+    } else if (jobId && job && TERMINAL.has(job.status)) {
+      onJobEnd?.();
+    }
+  }, [isRunning, jobId, job, onJobStart, onJobEnd]);
 
   const hasInput = mode === 'filter' ? filterId.trim() : boardKey.trim();
   const canRun = !isRunning && adoProject.trim() && hasInput && adoBoard.trim();

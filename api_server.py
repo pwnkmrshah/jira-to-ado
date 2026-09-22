@@ -385,6 +385,20 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
             except Exception:
                 pass  # keep original status if CSV parsing fails
 
+        # For verify jobs, also read the CSV file if it exists
+        verify_csv_path = _jobs[job_id].get('csv_path', '')
+        verify_csv_str = ''
+        if verify_csv_path:
+            import os as _os_verify
+            if _os_verify.path.exists(verify_csv_path):
+                try:
+                    with open(verify_csv_path) as _f:
+                        verify_csv_str = _f.read()
+                    _os_verify.unlink(verify_csv_path)
+                    logging.info(f"[{job_id}] Verify CSV read ({len(verify_csv_str)} bytes)")
+                except Exception as _e:
+                    logging.warning(f"[{job_id}] Failed to read verify CSV: {_e}")
+
         with _jobs_lock:
             _jobs[job_id].update({
                 'status': final_status,
@@ -395,7 +409,7 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
                 'error_summary': _categorize_error(rc, stdout_buf, error_lines),
                 'return_code': rc,
                 'finished_at': datetime.utcnow().isoformat() + 'Z',
-                'card_csv': card_csv_str,
+                'card_csv': card_csv_str or verify_csv_str,  # For verify jobs, use verify CSV
             })
         logging.info(
             f"[{job_id}] DONE   exit={rc}  status={final_status}  "
@@ -1295,12 +1309,14 @@ def verify():
 
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     report_path = str(REPORTS_DIR / f'verify_{ts}.html')
+    csv_path = str(REPORTS_DIR / f'verify_{ts}.csv')
 
     cmd = [
         'python3', str(SCRIPTS_DIR / 'verify_migration.py'),
         '--jira-instance', jira_instance,
         '--ado-project', ado_project,
         '--output', report_path,
+        '--csv-output', csv_path,
     ]
     if project_key:
         cmd += ['--project-key', project_key]
@@ -1311,7 +1327,7 @@ def verify():
 
     # Merge Jira and ADO credential env vars
     env_overrides = {**jira_env, **ado_env}
-    job_id = _spawn(cmd, extra_fields={'report': report_path}, env_overrides=env_overrides)
+    job_id = _spawn(cmd, extra_fields={'report': report_path, 'csv_path': csv_path}, env_overrides=env_overrides)
     return jsonify({'job_id': job_id, 'status': 'queued', 'report': report_path}), 202
 
 

@@ -9,11 +9,18 @@ export default function JobStatusPanel({ job, jobId, extraSummary }) {
     ? output.trim().split('\n').filter((l) => l.trim()).slice(-8)
     : [];
 
+  const isTerminal = ['completed', 'warning', 'failed'].includes(status);
+
   return (
     <div className="job-panel">
-      <span className={`status-badge status-${status}`}>{status}</span>
+      <span className={`status-badge status-${status}`}>
+        {status === 'completed' && '✅ COMPLETED'}
+        {status === 'failed' && '❌ FAILED'}
+        {status === 'warning' && '⚠️ WARNING'}
+        {!isTerminal && status.toUpperCase()}
+      </span>
 
-      {progress?.total > 0 && (
+      {progress?.total > 0 && !isTerminal && (
         <div className="progress-bar">
           <div
             className="progress-fill"

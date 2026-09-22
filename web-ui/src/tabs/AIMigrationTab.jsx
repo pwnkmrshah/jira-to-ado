@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api, loadCreds } from '../lib/api.js';
 
-export default function AIMigrationTab() {
+export default function AIMigrationTab({ onJobStart, onJobEnd }) {
   const creds = loadCreds();
   
   // Jira projects state
@@ -34,6 +34,24 @@ export default function AIMigrationTab() {
   const [isMigrating, setIsMigrating] = useState(false);
   const [migrationResult, setMigrationResult] = useState(null);
   const [migrationError, setMigrationError] = useState('');
+
+  // Notify parent when analysis starts/ends
+  useEffect(() => {
+    if (isAnalyzing) {
+      onJobStart?.('ai-migrate');
+    } else if (!isAnalyzing && analysisResult) {
+      onJobEnd?.();
+    }
+  }, [isAnalyzing, analysisResult, onJobStart, onJobEnd]);
+
+  // Notify parent when migration starts/ends
+  useEffect(() => {
+    if (isMigrating) {
+      onJobStart?.('ai-migrate');
+    } else if (!isMigrating && migrationResult) {
+      onJobEnd?.();
+    }
+  }, [isMigrating, migrationResult, onJobStart, onJobEnd]);
 
   // Fetch Jira projects on mount
   useEffect(() => {

@@ -15,8 +15,12 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('ai-migrate');
   // Bumping this forces a re-render so `isReady` re-reads session storage.
   const [credsVersion, setCredsVersion] = useState(0);
+  const [activeJobTab, setActiveJobTab] = useState(null);  // Track which tab has a running job
   const creds = loadCreds();
   const isReady = !!(creds.apiKey && creds.jiraUrl && creds.jiraEmail && creds.jiraToken);
+
+  const onJobStart = (tabId) => setActiveJobTab(tabId);
+  const onJobEnd = () => setActiveJobTab(null);
 
   return (
     <div className="app-shell">
@@ -35,15 +39,18 @@ export default function App() {
                 type="button"
                 className={activeTab === t.id ? 'active' : ''}
                 onClick={() => setActiveTab(t.id)}
+                disabled={activeJobTab && activeJobTab !== t.id}
+                title={activeJobTab && activeJobTab !== t.id ? `Wait for ${TABS.find(x => x.id === activeJobTab)?.label} to finish` : ''}
               >
                 {t.label}
+                {activeJobTab === t.id && ' ⏳'}
               </button>
             ))}
           </nav>
           <main>
-            {activeTab === 'ai-migrate' && <AIMigrationTab key={credsVersion} />}
-            {activeTab === 'gaps' && <GapAnalysisTab key={credsVersion} />}
-            {activeTab === 'verify' && <VerifyTab key={credsVersion} />}
+            {activeTab === 'ai-migrate' && <AIMigrationTab key={credsVersion} onJobStart={onJobStart} onJobEnd={onJobEnd} />}
+            {activeTab === 'gaps' && <GapAnalysisTab key={credsVersion} onJobStart={onJobStart} onJobEnd={onJobEnd} />}
+            {activeTab === 'verify' && <VerifyTab key={credsVersion} onJobStart={onJobStart} onJobEnd={onJobEnd} />}
           </main>
         </>
       ) : (
