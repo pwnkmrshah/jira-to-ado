@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api, loadCreds } from '../lib/api.js';
+import { useJob } from '../hooks/useJob.js';
+import JobStatusPanel from '../components/JobStatusPanel.jsx';
 
 export default function AIMigrationTab({ onJobStart, onJobEnd }) {
   const creds = loadCreds();
@@ -30,16 +32,14 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
   const [typeMappingSelections, setTypeMappingSelections] = useState({});
   const [stateMappingSelections, setStateMappingSelections] = useState({});
   
-  // Migration state
-  const [isMigrating, setIsMigrating] = useState(false);
-  const [migrationResult, setMigrationResult] = useState(null);
-  const [migrationError, setMigrationError] = useState('');
+  // Migration state - use useJob hook for proper status tracking
+  const { job: migrationJob, jobId: migrationJobId, startError: migrationError, isRunning: isMigrating, start: startMigration } = useJob();
 
   // Notify parent when analysis starts/ends
   useEffect(() => {
     if (isAnalyzing) {
       onJobStart?.('ai-migrate');
-    } else if (!isAnalyzing && analysisResult) {
+    } else if (analysisResult) {
       onJobEnd?.();
     }
   }, [isAnalyzing, analysisResult, onJobStart, onJobEnd]);
@@ -48,10 +48,10 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
   useEffect(() => {
     if (isMigrating) {
       onJobStart?.('ai-migrate');
-    } else if (!isMigrating && migrationResult) {
+    } else if (migrationJobId && migrationJob && ['completed', 'failed', 'warning'].includes(migrationJob.status)) {
       onJobEnd?.();
     }
-  }, [isMigrating, migrationResult, onJobStart, onJobEnd]);
+  }, [isMigrating, migrationJobId, migrationJob, onJobStart, onJobEnd]);
 
   // Fetch Jira projects on mount
   useEffect(() => {
@@ -154,59 +154,45 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
     }
   };
 
-  const handleProceedToMigration = async () => {
-    setIsMigrating(true);
-    setMigrationError('');
-    setMigrationResult(null);
-    
-    try {
-      console.log('[MIGRATE] Starting migration with mappings:', {
-        types: typeMappingSelections,
-        states: stateMappingSelections
-      });
+  const handleProceedToMigration = () => {
+    console.log('[MIGRATE] Starting migration with mappings:', {
+      types: typeMappingSelections,
+      states: stateMappingSelections
+    });
 
-      // Build migration payload
-      const payload = {
-        jira_project_key: selectedJiraProject,
-        ado_project: selectedAdoProject,
-        type_mappings: typeMappingSelections,
-        state_mappings: stateMappingSelections,
-        // Include credentials for worker
-        jira_url: creds.jiraUrl,
-        jira_email: creds.jiraEmail,
-        jira_token: creds.jiraToken,
-        ado_org: creds.adoOrg,
-        ado_pat: creds.adoPat,
-      };
+    // Build migration payload
+    const payload = {
+      jira_project_key: selectedJiraProject,
+      ado_project: selectedAdoProject,
+      type_mappings: typeMappingSelections,
+      state_mappings: stateMappingSelections,
+      // Include credentials for worker
+      jira_url: creds.jiraUrl,
+      jira_email: creds.jiraEmail,
+      jira_token: creds.jiraToken,
+      ado_org: creds.adoOrg,
+      ado_pat: creds.adoPat,
+    };
 
-      // Add scope parameters (backend requires at least one: jira_filter, jira_keys, or jql)
-      if (scopeType === 'filter' && filterId.trim()) {
-        payload.jira_filter = filterId.trim();
-        console.log('[MIGRATE] Using filter:', filterId);
-      } else if (scopeType === 'specific-issues' && issueKeys.trim()) {
-        payload.jira_keys = issueKeys.split(',').map(k => k.trim()).filter(k => k);
-        console.log('[MIGRATE] Using specific issues:', payload.jira_keys);
-      } else if (scopeType === 'entire-board' && analysisResult?.jql_used) {
-        // For entire board, use the JQL from analysis
-        payload.jql = analysisResult.jql_used;
-        console.log('[MIGRATE] Using entire board JQL:', payload.jql);
-      } else {
-        throw new Error('No migration scope provided. Please select a filter, specific issues, or analyze the entire board.');
-      }
-
-      console.log('[MIGRATE] Sending payload:', payload);
-      const result = await api.migrate(payload);
-      console.log('[MIGRATE] Response received:', result);
-      
-      setMigrationResult(result);
-      alert('✅ Migration started! Job ID: ' + (result.job_id || 'pending'));
-    } catch (err) {
-      console.error('[MIGRATE] Error:', err);
-      setMigrationError(err.message || 'Migration failed');
-      alert('❌ Migration failed: ' + err.message);
-    } finally {
-      setIsMigrating(false);
+    // Add scope parameters (backend requires at least one: jira_filter, jira_keys, or jql)
+    if (scopeType === 'filter' && filterId.trim()) {
+      payload.jira_filter = filterId.trim();
+      console.log('[MIGRATE] Using filter:', filterId);
+    } else if (scopeType === 'specific-issues' && issueKeys.trim()) {
+      payload.jira_keys = issueKeys.split(',').map(k => k.trim()).filter(k => k);
+      console.log('[MIGRATE] Using specific issues:', payload.jira_keys);
+    } else if (scopeType === 'entire-board' && analysisResult?.jql_used) {
+      // For entire board, use the JQL from analysis
+      payload.jql = analysisResult.jql_used;
+      console.log('[MIGRATE] Using entire board JQL:', payload.jql);
+    } else {
+      console.error('[MIGRATE] No migration scope provided');
+      alert('No migration scope provided. Please select a filter, specific issues, or analyze the entire board.');
+      return;
     }
+
+    console.log('[MIGRATE] Sending payload:', payload);
+    startMigration(() => api.migrate(payload));
   };
 
   return (
@@ -557,18 +543,15 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
         </div>
       )}
 
-      {migrationResult && (
-        <div className="analysis-results">
-          <h3>✅ Migration Started Successfully!</h3>
-          <p>Job ID: <strong>{migrationResult.job_id || 'pending'}</strong></p>
-          <p>Status: <strong>{migrationResult.status || 'Running'}</strong></p>
-          {migrationResult.message && <p>{migrationResult.message}</p>}
-          <p className="hint">You can monitor progress in the Migrate tab or check the job status here.</p>
-        </div>
+      {migrationJobId && (
+        <JobStatusPanel
+          job={migrationJob}
+          jobId={migrationJobId}
+        />
       )}
 
       {migrationError && (
-        <p className="status-fail">❌ Migration Error: {migrationError}</p>
+        <p className="status-fail">❌ {migrationError}</p>
       )}
     </section>
   );

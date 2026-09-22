@@ -106,16 +106,40 @@ def _fetch_filter_jql(jira_url: str, email: str, token: str, filter_id: str) -> 
 
 
 def _fetch_issues(jira_url: str, email: str, token: str, jql: str) -> list[dict]:
+    """
+    Fetch ALL issues matching the JQL, using pagination.
+    Jira API returns at most maxResults per request, so we loop until we get them all.
+    """
     url = f"{jira_url.rstrip('/')}/rest/api/3/search/jql"
-    body = {
-        "jql": jql,
-        "maxResults": SAMPLE_SIZE,
-        "fields": ["issuetype", "status", "assignee", "attachment", "comment", "priority"],
-    }
+    all_issues = []
+    start_at = 0
+    page_size = 100  # Jira default
+    
     try:
-        r = requests.post(url, auth=(email, token), json=body, timeout=15)
-        r.raise_for_status()
-        return r.json().get("issues", [])
+        while True:
+            body = {
+                "jql": jql,
+                "startAt": start_at,
+                "maxResults": page_size,
+                "fields": ["issuetype", "status", "assignee", "attachment", "comment", "priority"],
+            }
+            r = requests.post(url, auth=(email, token), json=body, timeout=15)
+            r.raise_for_status()
+            
+            data = r.json()
+            issues = data.get("issues", [])
+            all_issues.extend(issues)
+            
+            # Check if there are more results
+            total = data.get("total", 0)
+            if start_at + len(issues) >= total:
+                # We've fetched all available issues
+                break
+            
+            start_at += page_size
+        
+        logger.info(f"[analysis] Fetched {len(all_issues)} total issues (pagination complete)")
+        return all_issues
     except Exception as exc:
         logger.error("[analysis] Jira search/jql POST failed: %s", exc)
         return []

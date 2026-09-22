@@ -1039,7 +1039,14 @@ def migrate():
     jira_instance = body.get('jira_instance', 'healthfinch')
     ado_project = body.get('ado_project', '').strip() or 'Embedded Refills Engineering'
     jira_filter = body.get('jira_filter', '').strip()
-    jira_keys = body.get('jira_keys', '').strip()
+    
+    # Handle jira_keys: can be a list (from frontend) or string (from API)
+    jira_keys_raw = body.get('jira_keys', [])
+    if isinstance(jira_keys_raw, list):
+        jira_keys = ','.join(str(k).strip() for k in jira_keys_raw if k)
+    else:
+        jira_keys = (jira_keys_raw or '').strip()
+    
     jql = body.get('jql', '').strip()
     field_filter = [f.strip() for f in (body.get('field_filter') or []) if f.strip()]
     ado_team_name = body.get('ado_team_name', '').strip()
@@ -1299,7 +1306,14 @@ def verify():
     jira_instance = body.get('jira_instance', 'healthfinch')
     ado_project = body.get('ado_project', 'Embedded Refills Engineering')
     project_key = body.get('project_key', '').strip()
-    jira_keys = body.get('jira_keys', '').strip()
+    
+    # Handle jira_keys: can be a list (from frontend) or string (from API)
+    jira_keys_raw = body.get('jira_keys', [])
+    if isinstance(jira_keys_raw, list):
+        jira_keys = ','.join(str(k).strip() for k in jira_keys_raw if k)
+    else:
+        jira_keys = (jira_keys_raw or '').strip()
+    
     jira_filter = body.get('jira_filter', '').strip()
     jira_env = _jira_env_from_body(body)
     ado_env = _ado_env_from_body(body)
