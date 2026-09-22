@@ -276,11 +276,11 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments, ado_projec
 
     checks = {}
 
-    # # Work Item Type
-    # checks["Work Item Type"] = chk(
-    #     ado_item and ado_type.lower() == expected_type.lower(),
-    #     jira_type, ado_type,
-    #     f"Expected '{expected_type}', got '{ado_type}'")
+    # Work Item Type
+    checks["Work Item Type"] = chk(
+        ado_item and ado_type.lower() == expected_type.lower(),
+        jira_type, ado_type,
+        f"Expected '{expected_type}', got '{ado_type}'")
 
     # State / Workflow
     checks["State"] = chk(
