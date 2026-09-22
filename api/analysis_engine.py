@@ -189,24 +189,29 @@ def _fetch_ado_users_from_workitems(ado_org: str, ado_project: str, ado_pat: str
     Fetches users by querying work items with assignees in the ADO project.
     Returns a set of lowercased email addresses of users assigned to work items.
     """
-    # WIQL query to get work items with assignees
-    wiql_query = "SELECT [System.Id], [System.AssignedTo] FROM WorkItems WHERE [Team Project] = @project AND [System.AssignedTo] <> '' ORDER BY [System.Id]"
+    # WIQL query with @project variable (ADO will substitute it)
+    wiql_query = "SELECT [System.Id], [System.AssignedTo] FROM WorkItems WHERE [Team Project] = @project AND [System.AssignedTo] <> ''"
     
     url = f"https://dev.azure.com/{ado_org}/{ado_project}/_apis/wit/wiql?api-version=7.0"
     
     try:
-        # Execute WIQL query
+        # Execute WIQL query with variables parameter
         r = requests.post(
             url,
             auth=("", ado_pat),
-            json={"query": wiql_query},
-            timeout=15
+            json={
+                "query": wiql_query,
+                "variables": {}  # ADO automatically substitutes @project
+            },
+            timeout=30
         )
         r.raise_for_status()
         
         workitem_refs = r.json().get("workItems", [])
+        logger.info(f"[analysis] Found {len(workitem_refs)} work items with assignees in project")
+        
         if not workitem_refs:
-            logger.info("[analysis] No work items found in project")
+            logger.warning("[analysis] WIQL returned no work items - users from this project cannot be fetched")
             return set()
         
         # Now fetch the actual work items to get assignee details
@@ -231,6 +236,7 @@ def _fetch_ado_users_from_workitems(ado_org: str, ado_project: str, ado_pat: str
                 if email and "@" in email:
                     users.add(email)
         
+        logger.info(f"[analysis] Extracted {len(users)} unique users from work items: {users}")
         return users
         
     except Exception as exc:
@@ -581,12 +587,19 @@ def run_analysis(
         status = ((fields.get("status") or {}).get("name") or "Unknown")
         status_counts[status] = status_counts.get(status, 0) + 1
 
+        # Extract BOTH assignee and reporter emails
         assignee_email = ((fields.get("assignee") or {}).get("emailAddress") or "").lower()
         if assignee_email:
             jira_emails.add(assignee_email)
+        
+        reporter_email = ((fields.get("reporter") or {}).get("emailAddress") or "").lower()
+        if reporter_email:
+            jira_emails.add(reporter_email)
 
         attachment_total += len(fields.get("attachment") or [])
         comment_total += (fields.get("comment") or {}).get("total", 0)
+
+    logger.info(f"[analysis] Extracted {len(jira_emails)} unique emails from Jira (assignees + reporters): {jira_emails}")
 
     # 4. Fetch ADO data (run both; they're independent)
     ado_types = _fetch_ado_work_item_types(ado_org, ado_project, ado_pat)
@@ -605,15 +618,20 @@ def run_analysis(
     ]
 
     # Only report user gaps when we successfully fetched ADO users
-    user_gaps = (
-        [
+    if ado_users:
+        logger.info(f"[analysis] ADO users found: {len(ado_users)} unique emails: {ado_users}")
+        user_gaps = [
             {"jira_user": email, "found_in_ado": False}
             for email in sorted(jira_emails)
             if email not in ado_users
         ]
-        if ado_users
-        else []
-    )
+        if user_gaps:
+            logger.warning(f"[analysis] User gaps detected: {[g['jira_user'] for g in user_gaps]}")
+        else:
+            logger.info(f"[analysis] All Jira users found in ADO")
+    else:
+        logger.warning("[analysis] No ADO users could be fetched - user gap detection disabled")
+        user_gaps = []
 
     by_type_list = [
         {"name": t, "count": c}
