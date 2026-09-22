@@ -132,7 +132,7 @@ def _fetch_ado_work_item_types(ado_org: str, ado_project: str, ado_pat: str) -> 
         "_apis/wit/workitemtypes?api-version=7.0"
     )
     try:
-        r = requests.get(url, auth=("", ado_pat), timeout=12)
+        r = requests.get(url, auth=("", ado_pat), timeout=30)
         r.raise_for_status()
         return [t["name"] for t in r.json().get("value", [])]
     except Exception as exc:
@@ -154,7 +154,7 @@ def _fetch_ado_states(ado_org: str, ado_project: str, ado_pat: str, work_item_ty
             f"_apis/wit/workitemtypes/{quote(wit, safe='')}/states?api-version=7.0"
         )
         try:
-            r = requests.get(url, auth=("", ado_pat), timeout=12)
+            r = requests.get(url, auth=("", ado_pat), timeout=30)
             r.raise_for_status()
             for s in r.json().get("value", []):
                 name = s.get("name")
@@ -219,7 +219,7 @@ def _fetch_ado_users_from_workitems(ado_org: str, ado_project: str, ado_pat: str
         ids_param = ",".join(ids)
         details_url = f"https://dev.azure.com/{ado_org}/{ado_project}/_apis/wit/workitems?ids={ids_param}&fields=System.AssignedTo&api-version=7.0"
         
-        r = requests.get(details_url, auth=("", ado_pat), timeout=15)
+        r = requests.get(details_url, auth=("", ado_pat), timeout=30)
         r.raise_for_status()
         
         # Extract email addresses from assignees
@@ -245,7 +245,7 @@ def _fetch_ado_users_from_graph(ado_org: str, ado_pat: str) -> set[str]:
     """
     url = f"https://vssps.dev.azure.com/{ado_org}/_apis/graph/users?api-version=7.1-preview.1"
     try:
-        r = requests.get(url, auth=("", ado_pat), timeout=12)
+        r = requests.get(url, auth=("", ado_pat), timeout=30)
         if r.status_code in (403, 401):
             logger.info("[analysis] ADO Graph API not in PAT scope — cannot verify user availability")
             return set()
