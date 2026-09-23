@@ -12,6 +12,265 @@ Complete migration suite for copying work items from Jira to Azure DevOps with v
 
 ---
 
+## 🚀 Quick Start (5 Minutes)
+
+### Prerequisites
+
+- **Docker & Docker Compose** (recommended) — Windows, Mac, or Linux
+  - Download: https://www.docker.com/products/docker-desktop
+  - Verify: `docker --version && docker-compose --version`
+
+- **OR Python 3.11+** (if running without Docker)
+  - Download: https://www.python.org/downloads/
+  - Verify: `python3 --version`
+
+- **Jira API Token** — Get from https://id.atlassian.com/manage-profile/security/api-tokens
+- **ADO Personal Access Token** — Get from https://dev.azure.com/{org}/_usersSettings/tokens
+  - Must include scopes: **Work Items (Read & Write)**, **Project & Team (Read)**
+  - For field creation: **Edit process** permission at Organization level (Organization Settings → Permissions)
+
+### Step 1: Clone & Setup
+
+```bash
+git clone https://github.com/health-catalyst/jira-to-ado.git
+cd jira-to-ado
+```
+
+### Step 2: Create Environment File
+
+Create a `.env` file in the project root with your credentials:
+
+```bash
+# .env
+JIRA_INSTANCE=healthfinch
+JIRA_EMAIL=your.email@healthcatalyst.com
+JIRA_TOKEN=your-jira-api-token-here
+
+ADO_ORG=healthcatalyst
+ADO_PAT=your-ado-pat-here
+
+MIGRATION_API_KEY=demo-key-change-me
+GPT_API_KEY=your-azure-openai-key-for-ai-mapping
+```
+
+### Step 3: Start the Application
+
+**Using Docker (Recommended):**
+```bash
+docker-compose up --build
+```
+
+**OR manually (without Docker):**
+```bash
+# Install dependencies
+pip install -r requirements.txt
+pip install -r jira_ado_copy/requirements.txt
+pip install flask requests
+
+# Start backend
+python3 api_server.py
+
+# In another terminal, start frontend
+cd web-ui
+npm install
+npm run dev
+```
+
+### Step 4: Open Web UI
+
+- **Backend API:** http://localhost:5001
+- **Web UI:** http://localhost:3000
+
+You should see:
+
+```
+Jira → Azure DevOps Migration
+
+Connection Settings
+──────────────────────────────────────────────
+Backend API base URL    │ https://localhost:5001
+API Key                 │ [demo-key-change-me]
+
+Jira URL                │ https://healthfinch.atlassian.net
+Jira Email              │ your.email@...
+Jira API Token          │ [demo-key-change-me]
+
+ADO Organization        │ healthcatalyst
+ADO Personal Access Tok │ [your-ado-pat]
+ADO Default Project     │ Embedded Refills Engineering
+
+                        [Test Connection] [Save]
+```
+
+### Step 5: Test Connection
+
+1. Fill in all credentials above
+2. Click **[Test Connection]** — should show ✅ **Credentials validated**
+3. Click **[Save]** — credentials stored in browser session
+4. Navigate to **AI Migration** tab
+
+### Step 6: Your First Migration
+
+**Tab: AI Migration**
+
+```
+SOURCE
+  Jira Board: [Select from dropdown] ← Shows all Jira projects
+
+SCOPE
+  ○ Entire board                       ← Start here!
+  
+TARGET
+  ADO Project: [dropdown]              ← Shows all ADO projects
+
+                    [🔍 Analyze]
+```
+
+1. Select a Jira board (small project recommended for first run)
+2. Keep "Entire board" selected
+3. Select target ADO project
+4. Click **[Analyze]** — waits 30-60 seconds
+
+**Analysis results show:**
+```
+✓ Issue Counts
+  • Jira issues found: 256
+  • Ready to migrate: 256
+
+⚠️  Type Gaps (if any)
+  • Jira Epic → [User Story] (AI suggestion, can change)
+
+⚠️  State Gaps (if any)
+  • Jira "Blocked" → [New] (AI suggestion, can change)
+
+👥 User Gaps (if any)
+  • user@example.com not found in ADO
+
+📊 Custom Fields
+  • Story Points (found & will map)
+  • Release (will create if permission available)
+```
+
+5. Review mappings, adjust if needed
+6. Click **[Proceed to Migration]** — creates work items in ADO
+
+**Results shown in JobStatusPanel:**
+```
+Status: running
+Output: [migration progress...]
+```
+
+Wait for status to change to `completed` (green ✅) or `warning` (yellow ⚠️).
+
+---
+
+## Installation & Configuration
+
+### Full Prerequisites
+
+**System:**
+- Windows, Mac, or Linux
+- 2GB+ RAM (for Docker)
+- 500MB+ disk space (for dependencies + logs)
+
+**Software:**
+- Docker & Docker Compose (recommended) — https://www.docker.com/
+- OR Python 3.11+ — https://www.python.org/
+- Node.js 18+ (only if running frontend manually) — https://nodejs.org/
+
+**Access Tokens (Required):**
+
+1. **Jira API Token**
+   - Go to: https://id.atlassian.com/manage-profile/security/api-tokens
+   - Click **Create API token**
+   - Copy the token (won't be shown again)
+   - Use with your Jira email for authentication
+
+2. **Azure DevOps Personal Access Token**
+   - Go to: https://dev.azure.com/{org}/_usersSettings/tokens
+   - Click **New Token**
+   - Name: `jira-to-ado-migration`
+   - Scopes:
+     - ✅ **Work Items**: Read & Write
+     - ✅ **Project & Team**: Read
+     - ✅ **Process**: Read & Manage (optional, for field creation)
+   - Expiration: 90 days minimum
+   - Copy token (won't be shown again)
+
+3. **Azure OpenAI API Key** (optional, for AI-driven mapping)
+   - Used by `/analyze` endpoint to generate field/state mapping suggestions
+   - Get from: https://portal.azure.com → OpenAI resource → Keys
+   - Falls back to manual mapping if not provided
+
+### Configuration Files
+
+**config/jira_config.json:**
+```json
+{
+  "server": "https://healthfinch.atlassian.net",
+  "email": "your.email@healthcatalyst.com",
+  "access_token": "your-jira-api-token"
+}
+```
+
+**config/ado_config.json:**
+```json
+{
+  "organization_url": "https://dev.azure.com/healthcatalyst",
+  "username": "your.name@healthcatalyst.com",
+  "access_token": "your-ado-pat",
+  "project": "Embedded Refills Engineering"
+}
+```
+
+**Environment variables (used by docker-compose):**
+```bash
+export JIRA_INSTANCE=healthfinch
+export JIRA_EMAIL=your.email@healthcatalyst.com
+export JIRA_TOKEN=your-jira-api-token
+export ADO_ORG=healthcatalyst
+export ADO_PAT=your-ado-pat
+export MIGRATION_API_KEY=demo-key-change-me
+export GPT_API_KEY=your-azure-openai-key
+```
+
+### Directory Structure After Setup
+
+```
+jira-to-ado/
+├── config/
+│   ├── jira_config.json              ← Jira credentials (create this)
+│   ├── ado_config.json               ← ADO credentials (create this)
+│   └── ...
+├── jira_ado_copy/
+│   ├── scripts/
+│   │   ├── worker_jira_to_ado_copy.py ← Main migration script
+│   │   ├── migration_gap_analysis.py  ← Gap finder script
+│   │   ├── verify_migration.py        ← Verification script
+│   │   └── ...
+│   └── jira_ado_copy.yaml            ← Config template
+├── utilities/
+│   ├── utils_ado.py                  ← ADO API wrapper
+│   ├── utils_jira.py                 ← Jira API wrapper
+│   └── ...
+├── web-ui/
+│   ├── src/
+│   │   ├── App.jsx                   ← Main React component
+│   │   ├── tabs/
+│   │   │   ├── AIMigrationTab.jsx    ← Migration tab
+│   │   │   ├── GapAnalysisTab.jsx    ← Gap analysis tab
+│   │   │   └── VerifyTab.jsx         ← Verification tab
+│   │   └── ...
+│   ├── package.json
+│   └── vite.config.js
+├── api_server.py                     ← Flask backend server
+├── docker-compose.yml                ← Docker setup
+├── .env                              ← Environment variables (create this)
+└── README.md                         ← This file
+```
+
+---
+
 ## Architecture: Forge App ↔ Local Scripts
 
 The Forge app runs in Atlassian's cloud (sandboxed Node.js). The Python scripts run on this local machine. They can't talk directly — `api_server.py` is the bridge.
@@ -39,6 +298,71 @@ worker_jira_to_ado_copy.py
 ```
 
 **Everything runs locally.** ngrok is just a public HTTPS tunnel so Atlassian's servers can reach `localhost:5001`. The actual Jira reads and ADO writes happen from this machine using the credentials in `config/`.
+
+---
+
+## Docker Setup & Environment
+
+### Using Docker Compose (Recommended)
+
+**Build and run the complete stack:**
+
+```bash
+docker-compose up --build
+```
+
+This starts:
+- Backend API server (`api_server.py`, port 5001)
+- Frontend React UI (Vite, port 3000)
+- Web-UI accessible at: http://localhost:3000
+
+**Environment Variables (in docker-compose.yml):**
+
+```yaml
+environment:
+  - JIRA_INSTANCE=healthfinch
+  - JIRA_EMAIL=${JIRA_EMAIL}
+  - JIRA_TOKEN=${JIRA_TOKEN}
+  - ADO_ORG=healthcatalyst
+  - ADO_PAT=${ADO_PAT}
+  - MIGRATION_API_KEY=demo-key-change-me
+  - GPT_API_KEY=${GPT_API_KEY}  # For AI-driven field mapping
+```
+
+**Set these before running:**
+
+```bash
+export JIRA_EMAIL="your.email@healthcatalyst.com"
+export JIRA_TOKEN="your-jira-api-token"
+export ADO_PAT="your-ado-personal-access-token"
+export GPT_API_KEY="your-azure-openai-key"
+```
+
+Then:
+```bash
+docker-compose up --build
+```
+
+### Stopping Docker
+
+```bash
+docker-compose down
+```
+
+### View Logs
+
+```bash
+docker-compose logs -f api_server   # Backend
+docker-compose logs -f web-ui       # Frontend
+```
+
+### Production Deployment
+
+For production, use `docker-compose.prod.yml`:
+
+```bash
+docker-compose -f docker-compose.prod.yml up --build
+```
 
 ---
 
@@ -92,6 +416,301 @@ curl -H "X-API-Key: demo-key-change-me" http://localhost:5001/ado-projects
 # Connection ping (requires API key)
 curl -H "X-API-Key: demo-key-change-me" http://localhost:5001/ping
 ```
+
+---
+
+## Web UI Flow & Tabs
+
+The React frontend (http://localhost:3000) provides three integrated migration tabs with credential management.
+
+### Connection Setup (Required First)
+
+Before using any tab, fill in the **Credentials Bar** at the top:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Connection Settings                                          │
+├─────────────────────────────────────────────────────────────┤
+│ Backend API base URL    │ https://localhost:5001             │
+│ API Key                 │ [demo-key-change-me]               │
+│                                                               │
+│ Jira URL                │ https://healthfinch.atlassian.net   │
+│ Jira Email              │ your.email@healthcatalyst.com       │
+│ Jira API Token          │ [your-jira-api-token]               │
+│                                                               │
+│ ADO Organization        │ healthcatalyst                      │
+│ ADO Personal Access Tok │ [your-ado-pat]                      │
+│ ADO Default Project     │ Embedded Refills Engineering        │
+│                         [Test Connection] [Save]             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**What gets populated where:**
+- **Jira URL + Email + Token** → Used for `/analyze` and `/migrate` endpoints (Jira API calls)
+- **ADO Org + PAT** → Used for ADO REST API calls (field discovery, work item creation)
+- **API Key** → Authentication for all `/analyze`, `/migrate`, `/gaps`, `/verify` endpoints
+- **ADO Default Project** → Cached as default selection in tabs (can be overridden per-tab)
+
+**Credentials are stored in:**
+- Browser session storage only (cleared when tab closes)
+- Never written to disk
+- Never sent to backend (used by frontend to populate dropdowns locally when possible)
+
+---
+
+### Tab 1: AI Migration (Source → Analysis → Migrate)
+
+**Purpose:** Migrate Jira issues to ADO with AI-driven field/state mapping.
+
+**Workflow:**
+
+```
+┌──────────────────────────────┐
+│  1. SELECT SOURCE            │
+├──────────────────────────────┤
+│  Jira Board (dropdown)   │   │ ← Fetched from /analyze endpoint
+│                          │   │   (calls Jira /rest/api/3/projects)
+└──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│  2. CHOOSE SCOPE             │
+├──────────────────────────────┤
+│  ○ Entire board              │
+│  ○ Jira saved filter    [ID] │ ← Enter filter ID (numeric)
+│  ○ Specific issues     [CSV] │ ← Enter issue keys comma-separated
+└──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│  3. SELECT TARGET            │
+├──────────────────────────────┤
+│  ADO Project (dropdown)  │   │ ← Fetched from /analyze endpoint
+│                          │   │   (calls ADO /projects REST API)
+└──────────────────────────────┘
+                │
+                ▼
+        [🔍 Analyze]
+                │
+                ▼
+┌──────────────────────────────────────────┐
+│  4. REVIEW ANALYSIS RESULTS              │
+├──────────────────────────────────────────┤
+│  ✓ Issue Counts                          │
+│    • Total Jira issues: 1,256            │
+│    • Issues to migrate: 999              │
+│                                          │
+│  ⚠️  Type Gaps                           │ ← Work item types not in ADO
+│    • Jira Epic → No ADO match [dropdown] │ ← AI suggests mapping
+│    • Jira Task → User Story [dropdown]   │   (editable, user can override)
+│                                          │
+│  ⚠️  State Gaps                          │ ← Statuses not in ADO
+│    • Jira "Blocked" → [dropdown]         │   (editable)
+│                                          │
+│  👥 User Gaps                            │ ← Users not found in ADO
+│    • swapnali.patil@healthcatalyst.com   │   (ACTION NEEDED)
+│    • vikranth.ceakala@healthcatalyst.com │
+│                                          │
+│  📊 Custom Fields                        │ ← Extra fields in Jira
+│    • Story Points (found)                │
+│    • Reach (RICE) (not found)            │
+│    • Score (RICE) (not found)            │
+│                                          │
+│  🔗 Attachments: 245 total               │
+│  💬 Comments: 523 total                  │
+└──────────────────────────────────────────┘
+                │
+                ▼
+        [🚀 Proceed to Migration]
+                │
+                ▼
+        Backend creates work items
+        with selected type/state mappings
+```
+
+**Dropdowns explained:**
+- **Jira Board** → Populated by calling backend `/analyze` → Jira `/rest/api/3/projects`
+- **ADO Project** → Populated by backend `/analyze` → ADO `/_apis/projects` REST API
+- **Type Mappings** → AI generated (GPT) based on issue type analysis, user can override
+- **State Mappings** → AI generated (GPT) based on status analysis, user can override
+
+**Expected outputs from /analyze:**
+```json
+{
+  "type_mappings": [
+    { "jira": "Epic", "ado": "Epic", "confidence": 0.95 },
+    { "jira": "Story", "ado": "User Story", "confidence": 0.98 }
+  ],
+  "state_mappings": [
+    { "jira": "To Do", "ado": "New", "confidence": 0.90 },
+    { "jira": "In Progress", "ado": "Active", "confidence": 0.95 }
+  ],
+  "type_gaps": [ { "jira_type": "Incident" } ],
+  "state_gaps": [ { "jira_state": "Blocked" } ],
+  "user_gaps": [
+    { "jira_user": "user@example.com", "found_in_ado": false }
+  ],
+  "custom_fields": [
+    { "name": "Story Points", "type": "number" },
+    { "name": "Reach (RICE)", "type": "string" }
+  ],
+  "issue_count": 256,
+  "attachment_count": 245,
+  "comment_count": 523,
+  "jql_used": "project = PROJ ORDER BY created DESC"
+}
+```
+
+**After migration:**
+- Job status shown in **JobStatusPanel** (running → completed/warning/failed)
+- Migration log output displayed (last 8000 chars of stdout)
+- Errors shown in red (last 3000 chars of stderr)
+- Exit code shown (0 = success, non-zero = error)
+
+---
+
+### Tab 2: Gap Analysis (Find Missing Cards)
+
+**Purpose:** Identify cards in Jira that weren't migrated to ADO or are in wrong area paths.
+
+**Workflow:**
+
+```
+┌──────────────────────────────┐
+│  1. SELECT SOURCE            │
+├──────────────────────────────┤
+│  ○ Jira Filter ID      [ID]  │ ← Enter saved filter ID
+│  ○ Entire Jira Board  [KEY] │ ← Enter Jira project key (e.g., SUST)
+└──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│  2. ADO TARGET               │
+├──────────────────────────────┤
+│  ADO Project      │ Embedded │ ← Text input (matches against existing)
+│  ADO Team/Board   │ Team 1   │ ← Team name in ADO
+└──────────────────────────────┘
+                │
+                ▼
+        [Run Gap Analysis]
+                │
+                ▼
+┌──────────────────────────────────────┐
+│  RESULTS                             │
+├──────────────────────────────────────┤
+│  ✅  Correctly migrated:     130 (85%)│
+│  ❌  Not found anywhere:      12 (8%) │ ← NEEDS MIGRATION
+│  ⚠️   Wrong area path:         3 (2%) │ ← NEEDS MANUAL MOVE
+│                                      │
+│  CSV report: gaps_2026-09-23.csv    │
+│  (can be downloaded for remediation)│
+└──────────────────────────────────────┘
+```
+
+**Expected CSV output:**
+```
+JiraKey,ExistsInADO,ADOId,AreaPath,MissingAreaPath,NeedsMigration,Notes
+SUST-100,Yes,12345,/Team 1,,No,Correctly migrated
+SUST-101,Yes,12346,,Yes,Yes,Missing area path
+SUST-102,No,,,,Yes,Not migrated to ADO
+SUST-103,Yes,12347,/Team 2,,Yes,Wrong area path - should be /Team 1
+```
+
+---
+
+### Tab 3: Verify Migration (Validate Field Accuracy)
+
+**Purpose:** Compare Jira cards field-by-field against migrated ADO work items.
+
+**Workflow:**
+
+```
+┌──────────────────────────────┐
+│  1. SELECT SOURCE MODE       │
+├──────────────────────────────┤
+│  ○ By Project Key      [KEY] │ ← Verify ALL cards in project
+│  ○ Entire Jira Board   [KEY] │ ← Same as above
+│  ○ By Specific Keys   [CSV] │ ← Verify specific cards
+│  ○ By Jira Filter ID   [ID] │ ← Verify cards matching filter
+└──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────┐
+│  2. ADO TARGET               │
+├──────────────────────────────┤
+│  ADO Project    │ Embedded   │ ← Text input
+└──────────────────────────────┘
+                │
+                ▼
+        [Run Verification]
+                │
+                ▼
+┌──────────────────────────────────────────┐
+│  VERIFICATION SUMMARY                    │
+├──────────────────────────────────────────┤
+│  Total tickets    : 256                  │
+│  Found in ADO     : 250                  │
+│  Missing          : 6                    │
+│  Has failures     : 15                   │
+│  Pass rate        : 94%                  │
+│                                          │
+│  ⚠️  Failures detected (15 cards)       │
+│                                          │
+│  HTML report: verify_2026-09-23.html    │
+│  (detailed field-by-field comparison)   │
+└──────────────────────────────────────────┘
+```
+
+**HTML report includes:**
+- Per-card verification status (✅ PASS / ⚠️ WARNING / ❌ FAIL)
+- Field-by-field comparison for each card:
+  - Title (exact match check)
+  - Description (length/content check)
+  - State mapping validation
+  - Assignee presence check
+  - Attachment count comparison (Jira vs ADO)
+  - Comment count comparison
+  - Link count comparison
+- Attachment gap detection (which files failed to upload)
+- Summary statistics
+
+---
+
+### How Dropdowns Get Populated
+
+| Dropdown | Tab | API Call | Result |
+|----------|-----|----------|--------|
+| **Jira Board** | AI Migration | `/analyze` → Jira `/rest/api/3/projects` | List of Jira projects with id, name, key |
+| **ADO Project** | AI Migration | `/analyze` → ADO `/_apis/projects` | List of ADO projects with id, name |
+| **Type Mappings** | AI Migration | `/analyze` → GPT Responses API | AI-generated suggestions (Jira type → ADO type) |
+| **State Mappings** | AI Migration | `/analyze` → GPT Responses API | AI-generated suggestions (Jira status → ADO state) |
+
+**Note:** Gap Analysis & Verify tabs use **text input** (not dropdowns) because:
+- ADO Team/Board name varies per installation
+- Jira Project Key is static (e.g., SUST, OP, TM)
+- ADO Project name is static (e.g., "Embedded Refills Engineering")
+
+---
+
+### Error Handling in UI
+
+Each tab displays errors in two places:
+
+1. **Connection Error** (top of page) — If credentials invalid
+   ```
+   Could not fetch Jira projects. Check your connection settings.
+   ```
+
+2. **Job Error** (JobStatusPanel) — If migration/analysis fails
+   ```
+   Migration failed: Backend returned 500 Internal Server Error
+   Error details: [last 3000 chars of stderr]
+   ```
+
+**Common fixes:**
+- Verify credentials are saved (green ✅ in credentials bar)
+- Check backend is running (`docker-compose ps`)
+- Review logs: `docker-compose logs -f api_server`
 
 ### API Endpoints
 
@@ -403,6 +1022,56 @@ Expected: `final_report.csv` should be empty or contain only area-path misalignm
 
 All configuration files live in the `config/` directory at the project root.
 
+### Field Mapping Strategy
+
+The worker script uses a **4-step fuzzy matching algorithm** to discover and map custom fields from Jira to ADO:
+
+#### Step 1: Known Field Mappings
+Static dictionary of common Jira→ADO field name mappings:
+- `story point estimate` → `Story Points` (Microsoft.VSTS.Scheduling.StoryPoints)
+- `fix version` → `Fix Versions`
+- `release` → `Release`
+- `labels` → `Tags`
+- `rank` → `Rank`
+- `impact (rice)` → `Impact`
+- `effort (rice)` → `Effort`
+- `reach (rice)` → `Reach`
+- `confidence (rice)` → `Confidence`
+- `score (rice)` → `Score`
+
+#### Step 2: Exact Name Match
+Search ADO fields for exact name match (case-insensitive).
+
+#### Step 3: Contains Match
+Look for ADO field names that contain the Jira field name as a substring.
+
+#### Step 4: Token Fuzzy Overlap
+Use token-level fuzzy matching with 0.75 similarity threshold:
+- Split both names into words (tokens)
+- Calculate overlap ratio
+- Match if ratio ≥ 0.75
+
+#### Fallback: Description Block
+If no ADO field is found after all 4 steps:
+- Write field value to work item description in a formatted HTML section
+- Log as WARNING for manual review
+- Include field name, value, and remediation instructions
+
+### Custom Field Discovery
+
+During migration, the worker script:
+1. Extracts all non-standard Jira fields from issues (custom fields, RICE fields, etc.)
+2. For each field found, attempts to match it to an ADO field using the 4-step strategy
+3. If matched, writes the value to the ADO field
+4. If not matched and field is important (RICE, release, versions), attempts to create a new custom field in ADO
+5. If creation fails (due to permissions or validation), logs the error and falls back to description block
+
+**Permission Requirements for Custom Field Creation:**
+- Your ADO **Organization** must grant you "**Edit process**" permission (not just project admin)
+- This is an **organization-level** permission, not a project-level permission
+- You can grant it in: Organization Settings → Permissions → "Edit process"
+- If permission is missing, field creation will fail with: `VS402356: You do not have the permissions required to perform the attempted operation on this process.`
+
 ### ado_config.json
 
 Connection settings for Azure DevOps. See `config/example-ado_config.json`.
@@ -430,49 +1099,114 @@ Connection settings for Jira. See `config/example-jira_config.json`.
 
 > Note: When `--jira-instance` is provided, the server URL is built automatically as `https://<instance>.atlassian.net`, overriding the `server` value in the config file. The `email` and `access_token` are still read from the config.
 
-### type_config.json
+---
 
-Maps Jira issue types to ADO work item types. The `Default` key is used when no match is found.
+## Sprint → Iteration Mapping
 
-```json
-{
-  "Default": "Issue",
-  "Task": "Task",
-  "Bug": "Bug",
-  "Story": "User Story",
-  "Epic": "Epic"
-}
+The worker script automatically maps Jira sprints to ADO iterations:
+
+### How It Works
+
+1. **Sprint Extraction** — Reads Jira's `customfield_10007` (Sprint field)
+2. **Iteration Path Construction** — Builds ADO iteration path: `{ProjectName}\{TeamName}\{SprintName}`
+3. **Fallback Logic** — If the sprint-specific iteration path fails (e.g., sprint doesn't exist as an iteration node in ADO):
+   - Falls back to team default iteration path
+   - Logs warning: `[iteration-path] Failed to set sprint 'SUST Sprint 182': TF401347...`
+
+### Example
+
+**Jira Issue SUST-2259:**
+- Sprint: "SUST Sprint 182"
+- Team: "Sustaining Engineering Team"
+- Project: "Embedded Refills Engineering"
+
+**Attempted ADO iteration path:** 
+```
+Embedded Refills Engineering\Sustaining Engineering Team\SUST Sprint 182
 ```
 
-### state_config.json
-
-Maps Jira statuses to ADO states. The `Default` key is used when no match is found.
-
-```json
-{
-  "Default": "New",
-  "In Progress": "Active",
-  "Done": "Completed"
-}
+**If that fails (sprint node doesn't exist in ADO):**
+```
+Embedded Refills Engineering\Sustaining Engineering Team
 ```
 
-### custom_fields_config.json
+### Creating ADO Iterations
 
-Defines custom field mappings between Jira and ADO. Each entry specifies the ADO field path, the Jira custom field ID, and the sub-field name to extract from the Jira value.
+If you want sprint-specific iteration paths to work:
+1. Create iterations in ADO that match your Jira sprint names
+2. Go to: Azure DevOps Project → Project Settings → Iterations
+3. Create under the appropriate team with the exact sprint name
+4. Rerun migration
 
-```json
-[
-  {
-    "ado_field": "/fields/System.Tags",
-    "jira_field": "customfield_10007",
-    "jira_field_name": "name"
-  }
-]
-```
-
-
+---
 
 ## Troubleshooting & Known Issues
+
+### Permission Issues: "VS402356: You do not have permissions to perform operation on this process"
+
+**Symptom:** Migration completes but logs show:
+```
+VS402356: You do not have the permissions required to perform the attempted operation on this process.
+```
+
+This occurs when trying to attach fields to work item types.
+
+**Cause:** Your ADO user lacks **"Edit process"** permission at the **Organization level** (not project level).
+
+**Solution:**
+1. Go to Azure DevOps: **Organization Settings** (click your org name top-left)
+2. Select **Permissions** from left sidebar
+3. Find your user in the list
+4. Grant **"Edit process"** permission
+5. Wait 5-10 minutes for permission to propagate
+6. Retry migration
+
+**Note:** Project admin rights alone are NOT sufficient. Permission must be granted at organization level by an org admin.
+
+### User Gaps: "These users are not in ADO"
+
+**Symptom:** Analysis shows users as missing from ADO even though they're already members.
+
+**Cause (Old):** Previous logic only checked users assigned to existing work items, missing users invited but not yet assigned.
+
+**Fix (New):** Now uses ADO Graph API to check actual organization membership first, then falls back to assigned users.
+
+**Workaround if issue persists:**
+1. Verify users are actually members: Organization Settings → Members
+2. Re-run analysis — it should now detect them
+3. If still missing, check if Graph API is enabled in your PAT scope
+
+### Iteration Path: "TF401347: Invalid tree name given for work item"
+
+**Symptom:** Migration logs show:
+```
+TF401347: Invalid tree name given for work item 1234567, field 'System.IterationPath'
+```
+
+When attempting: `Embedded Refills Engineering\Sustaining Engineering Team\SUST Sprint 182`
+
+**Cause:** The sprint "SUST Sprint 182" doesn't exist as an iteration node in ADO.
+
+**Solution:**
+1. Create the iteration in ADO: Project Settings → Iterations
+2. Add under the correct team with exact sprint name
+3. Retry migration (worker script will auto-detect and use it)
+
+**Fallback (Already Implemented):** If sprint path fails, worker automatically sets team default iteration. Cards will be in backlog by default and can be manually moved.
+
+### Invalid Field Names: "VS402800: The name ... contains invalid characters"
+
+**Symptom:** Field creation fails with:
+```
+VS402800: The name 'Score (RICE)' is invalid. Names cannot be empty... or contain: '.,;~:/\*|?\"&%$!+=()[]{}<>-์.'
+```
+
+**Cause:** ADO rejects special characters including parentheses in field names.
+
+**Solution (Already Implemented):** Field names are sanitized before creation:
+- `Score (RICE)` → `Score RICE`
+- `Reach (RICE)` → `Reach RICE`
+- Other special characters removed or replaced with underscores
 
 ### Attachment Upload Failures
 
@@ -540,7 +1274,44 @@ Defines custom field mappings between Jira and ADO. Each entry specifies the ADO
 
 ---
 
-## Recent Changes (Current vs Production)
+## Recent Changes & Enhancements
+
+### Session 2026-09-23: User Detection, Custom Fields & Sprint Mapping
+
+**Major Changes:**
+- **User Gap Detection** — Now prioritizes ADO Graph API for accurate organization membership checks (fixes false-positive user gaps when users are invited but not yet assigned to work items)
+- **Custom Field Mapping** — Enhanced fuzzy matching with 4-step strategy:
+  1. Known field mappings (Story Points, Fix Versions, Effort, Impact, Reach)
+  2. Exact name match
+  3. Contains-match (field name contains target substring)
+  4. Token fuzzy overlap match (0.75 threshold)
+- **Sprint → Iteration Mapping** — Extract Jira sprint names and attempt `System.IterationPath` mapping with automatic fallback to team default iteration when sprint path not found
+- **Field Validation & Name Sanitization** — Remove special characters (parentheses) from RICE field names before creation (ADO rejects names like "Score (RICE)")
+- **Dynamic Field Discovery** — Improved logging for field attachment operations and permission error handling
+- **Permission Checks** — Clear errors when ADO "Edit process" permission is missing (VS402356)
+- **API Analysis Improvements** — Fixed JQL pagination headers and corrected GPT model name to gpt-5.4-mini
+
+**Files Modified:**
+- `api/analysis_engine.py` — User detection logic + Graph API prioritization
+- `jira_ado_copy/scripts/worker_jira_to_ado_copy.py` — Sprint extraction + iteration path setting + dynamic field discovery
+- `utilities/utils_ado.py` — 4-step fuzzy field matching + known field mappings + field creation/attachment
+- `utilities/utils_jira.py` — Custom field extraction for RICE and complex fields
+- `api_server.py` — Enhanced status endpoint with default field values
+- `docker-compose.yml` / `docker-compose.prod.yml` — Updated environment variables
+- `jira_ado_copy/scripts/verify_migration.py` — Enhanced logging
+
+**New Features:**
+- **Known Field Mappings** — Hardcoded mappings for common Jira→ADO fields (Story Points, Fix Versions, etc.)
+- **RICE Field Support** — Maps Jira RICE scoring fields (Impact, Reach, Confidence, Effort, Score) to ADO
+- **Permission Requirement** — Now validates ADO "Edit process" permission at org level (not project level)
+- **Fallback Iteration Path** — When sprint-specific iteration path fails, automatically use team default
+
+**Configuration Updates:**
+- Removed example config files (using code-based configuration instead)
+- Field mappings now in Python code, not JSON files
+- ADO credentials read from environment variables or ado_config.json
+
+### Previous Session Changes
 
 **+3,379 insertions, -233 deletions across 9 files**
 
