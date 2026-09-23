@@ -1,6 +1,0 @@
-[
-    {"ado_field": "/fields/System.Tags", "jira_field": "customfield_10007", "jira_field_name": "name"},
-    {"ado_field": "/fields/Microsoft.VSTS.Scheduling.StoryPoints", "jira_field": "customfield_10713", "jira_field_name": ""},
-    {"ado_field": "/fields/OPM.Environment", "jira_field": "customfield_10845", "jira_field_name": "value"},
-    {"ado_field": "/fields/Microsoft.VSTS.CMMI.Blocked", "jira_field": "customfield_10003", "jira_field_name": "value"}
-]

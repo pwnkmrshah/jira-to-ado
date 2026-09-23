@@ -17,6 +17,7 @@ services:
       PORT: 10000
       MIGRATION_API_KEY: ${MIGRATION_API_KEY:?error - MIGRATION_API_KEY must be set}
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+      GPT_API_KEY: ${GPT_API_KEY:-}
       PYTHONUNBUFFERED: 1
     # No volumes in production - immutable containers
     restart: always

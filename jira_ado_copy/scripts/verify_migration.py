@@ -215,7 +215,8 @@ def _has_broken_images(comments):
 # Verification
 # ---------------------------------------------------------------------------
 
-def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments, ado_project=None, jira_pr_data=None):
+def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments, ado_project=None,
+                  jira_pr_data=None, jira_client=None, mapping=None):
     fields        = jira_ticket['fields']
     jira_key      = jira_ticket['key']
     jira_type     = fields.get('issuetype', {}).get('name', '')
@@ -435,19 +436,70 @@ def verify_ticket(jira_ticket, ado_item, jira_comments, ado_comments, ado_projec
         f"Jira has {jira_attach}, ADO has {ado_attach}" if ado_attach != jira_attach else "")
 
     # Linked Issues / Relations (presence check only)
+    # Strict parent-link check: a Jira-URL hyperlink fallback no longer counts as a pass
+    # once the parent has actually been migrated — it means the real hierarchy relation
+    # is still missing on the ADO side, which is exactly the "children not linked" bug.
     if 'parent' in fields:
         parent_key = fields['parent']['key']
-        has_link = _has_relation(ado_item, 'Hierarchy-Reverse')
-        has_fallback = not has_link and any(
+        parent_ado_id = mapping.get(parent_key) if mapping else None
+        real_link = False
+        if ado_item and parent_ado_id:
+            for r in (ado_item.get('relations') or []):
+                if 'Hierarchy-Reverse' in r.get('rel', '') and str(parent_ado_id) in r.get('url', ''):
+                    real_link = True
+                    break
+        has_fallback = not real_link and any(
             r.get('rel') == 'Hyperlink' and parent_key in r.get('url', '')
             for r in (ado_item or {}).get('relations', []))
-        parent_ok = has_link or has_fallback
-        checks["Parent Link"] = chk(
-            parent_ok, parent_key,
-            "Present" if has_link else ("Hyperlink fallback" if has_fallback else "Missing"),
-            "" if parent_ok else "No parent relation found")
+
+        if real_link:
+            checks["Parent Link"] = chk(True, parent_key, f"Linked \u2192 ADO #{parent_ado_id}")
+        elif parent_ado_id:
+            # Parent already exists in ADO but this item isn't actually linked to it.
+            checks["Parent Link"] = chk(
+                False, parent_key, "Hyperlink fallback" if has_fallback else "Missing",
+                f"Parent {parent_key} is in ADO (#{parent_ado_id}) but no real hierarchy link exists")
+        elif has_fallback:
+            checks["Parent Link"] = chk(True, parent_key, "Hyperlink fallback (parent not yet migrated)")
+        else:
+            checks["Parent Link"] = chk(False, parent_key, "Missing", "No parent relation found")
     else:
         checks["Parent Link"] = chk(True, "(none)", "(none)")
+
+    # Child links: for every Jira child of this item, confirm a REAL Hierarchy-Forward
+    # relation exists on the ADO side pointing at that child's actual work item id.
+    # This is what catches "N children found in Jira but only M linked in ADO".
+    if jira_client is not None:
+        try:
+            child_resp = jira_client.search_jql_paginated(f'parent = {jira_key}')
+            jira_children = sorted(i['key'] for i in (child_resp or {}).get('issues', []) if i.get('key'))
+        except Exception:
+            jira_children = []
+
+        if jira_children:
+            linked_child_ado_ids = set()
+            for r in (ado_item or {}).get('relations', []):
+                if 'Hierarchy-Forward' in r.get('rel', ''):
+                    m = re.search(r'/workItems?/(\d+)$', r.get('url', ''), re.IGNORECASE)
+                    if m:
+                        linked_child_ado_ids.add(m.group(1))
+
+            missing_children = []
+            linked_count = 0
+            for child_key in jira_children:
+                child_ado_id = mapping.get(child_key) if mapping else None
+                if child_ado_id and str(child_ado_id) in linked_child_ado_ids:
+                    linked_count += 1
+                else:
+                    missing_children.append(child_key)
+
+            checks["Child Links"] = chk(
+                not missing_children,
+                f"{len(jira_children)} child(ren)",
+                f"{linked_count}/{len(jira_children)} linked",
+                f"Not linked in ADO: {', '.join(missing_children)}" if missing_children else "")
+        else:
+            checks["Child Links"] = chk(True, "(none)", "(none)")
 
     return {
         "jira_key":     jira_key,
@@ -879,7 +931,9 @@ def main():
             jira_comments,
             ado_comments,
             args.ado_project,
-            jira_pr_data
+            jira_pr_data,
+            jira_client=jira_client,
+            mapping=mapping,
         )
 
         results.append(result)

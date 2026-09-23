@@ -101,7 +101,7 @@ def clear_failed_issue(jira_key: str):
         FAILED_PATH.write_text(json.dumps(data, indent=2))
 
 
-def print_run_summary(succeeded: list, failed_items: list, base_cmd: str):
+def print_run_summary(succeeded: list, failed_items: list, base_cmd: str, ado_client=None):
     """Print a human-readable migration summary and a ready-to-use retry command."""
     total = len(succeeded) + len(failed_items)
     print("\n" + "=" * 60)
@@ -123,6 +123,17 @@ def print_run_summary(succeeded: list, failed_items: list, base_cmd: str):
     print("[summary]    for any parents not yet in ADO. To add real ADO parent/child links")
     print("[summary]    after all items are created, re-run this command with --jira-keys")
     print("[summary]    for any subtasks that had missing parents.")
+    if _UNRESOLVED_DYNAMIC_FIELDS:
+        field_list = ', '.join(sorted(_UNRESOLVED_DYNAMIC_FIELDS))
+        print(f"[summary] ⚠️  CUSTOM FIELDS NOT MAPPED TO ADO: {field_list}")
+        print("[summary]    These Jira fields have no matching ADO field and could not be")
+        print("[summary]    auto-created — their values were preserved in each item's")
+        print("[summary]    description under 'Jira Custom Fields' instead.")
+        if ado_client is not None and ado_client.field_creation_blocked():
+            print("[summary]    Reason: this PAT/account lacks 'Edit process' permission in ADO.")
+            print("[summary]    Fix: grant 'Edit process' (Organization Settings → Permissions),")
+            print("[summary]    or manually create these fields once in ADO with matching names —")
+            print("[summary]    future migrations will then map values to them automatically.")
     print("=" * 60 + "\n")
 
 # Maps (Jira link type name, direction) -> ADO relation type
@@ -145,6 +156,315 @@ _BOARD_SETUP_DONE: set = set()
 # per team so migrated items' System.IterationPath can be set to a value the team
 # actually has SELECTED (required for the Kanban Board to show them at all).
 _TEAM_ITERATION_PATH: dict = {}
+
+# Cache: Jira customfield_XXXXX id -> human-readable field name, populated once per
+# run from JiraClient.get_field_metadata() — lets dynamic custom-field mapping work
+# without a static custom_fields_config.json.
+_JIRA_FIELD_NAME_CACHE: dict = {}
+
+# Jira fields that already have dedicated handling elsewhere in create_or_update_work_item
+# (Sprint -> tags, Customers -> description) and should NOT also go through the generic
+# dynamic custom-field mapper below.
+_DYNAMIC_FIELD_EXCLUDE = {'customfield_10007', 'customfield_10907'}
+
+# Well-known top-level (non customfield_*) Jira fields worth mapping dynamically too.
+_DYNAMIC_TOP_LEVEL_FIELDS = {
+    'fixVersions': 'Fix Version/s',
+    'versions': 'Affects Versions',
+    'release': 'Release',
+    'labels': 'Labels',
+}
+
+# ADO fields this worker already populates via dedicated, purpose-built logic elsewhere
+# in create_or_update_work_item(). The generic dynamic-field matcher must never reuse
+# one of these for an unrelated Jira custom field just because the names sound similar
+# (e.g. a Jira custom field literally called "Start date" is NOT the same thing as
+# Custom.ActualStartDate, which is always derived from Jira's system 'created' date) —
+# doing so would silently overwrite/conflate two different pieces of data.
+_RESERVED_ADO_FIELD_REFS = {
+    'System.Title', 'System.State', 'System.Description', 'System.AssignedTo',
+    'System.Tags', 'System.AreaPath', 'System.IterationPath',
+    'Custom.RequestedBy', 'Custom.PriorityLevel',
+    'Custom.ActualStartDate', 'Custom.ActualCompletionDate',
+    'Microsoft.VSTS.Scheduling.TargetDate',
+}
+
+_UNMAPPED_FIELDS_MARKER_START = '<!-- JIRA-CUSTOM-FIELDS-START -->'
+_UNMAPPED_FIELDS_MARKER_END = '<!-- JIRA-CUSTOM-FIELDS-END -->'
+
+# Cross-ticket tally of Jira field display names that never got a real ADO field this
+# run (no match, and creation failed/blocked) — reported once in the final run summary.
+_UNRESOLVED_DYNAMIC_FIELDS: set = set()
+
+
+def _get_jira_field_name_map(jira_client: JiraClient) -> dict:
+    """Lazily fetch & cache the customfield_id -> display-name map for this Jira instance."""
+    if _JIRA_FIELD_NAME_CACHE:
+        return _JIRA_FIELD_NAME_CACHE
+    try:
+        for f in jira_client.get_field_metadata():
+            fid, name = f.get('id'), f.get('name')
+            if fid and name:
+                _JIRA_FIELD_NAME_CACHE[fid] = name
+    except Exception as e:
+        logging.warning(f"[dynamic-fields] Could not fetch Jira field metadata: {e}")
+    return _JIRA_FIELD_NAME_CACHE
+
+
+def _adf_to_plain_text(node) -> str:
+    """Best-effort plain-text extraction from an Atlassian Document Format node tree."""
+    if isinstance(node, dict):
+        if node.get('type') == 'text':
+            return node.get('text', '')
+        return ''.join(_adf_to_plain_text(c) for c in (node.get('content') or []))
+    if isinstance(node, list):
+        return ''.join(_adf_to_plain_text(n) for n in node)
+    return ''
+
+
+def _stringify_jira_custom_value(value):
+    """Convert an arbitrary Jira custom-field value into a plain string/number for ADO.
+
+    Handles scalars, single-select option objects ({'value'|'name': ...}), lists of
+    either (joined with ', '), and Atlassian Document Format rich-text nodes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        parts = [_stringify_jira_custom_value(v) for v in value]
+        parts = [str(p) for p in parts if p not in (None, '')]
+        return ', '.join(parts) if parts else None
+    if isinstance(value, dict):
+        if value.get('type') == 'doc' and 'content' in value:
+            text = _adf_to_plain_text(value).strip()
+            return text or None
+        for key in ('name', 'value', 'displayName'):
+            if value.get(key):
+                return value[key]
+        return None
+    return str(value)
+
+
+def sync_dynamic_custom_fields(ado_id: int, jira_ticket: dict, ado_type: str,
+                               jira_client: JiraClient, ado_client: AzureDevOpsClient):
+    """Discover Jira custom fields (RICE scores, Fix Version, etc.) that have no static
+    config entry, map each onto a matching (or newly created) ADO field, and fall back
+    to a dedicated description block for any field ADO can't accommodate.
+    """
+    if not jira_ticket or not isinstance(jira_ticket, dict):
+        return
+    fields = jira_ticket.get('fields') or {}
+    field_name_map = _get_jira_field_name_map(jira_client)
+
+    candidates = [k for k in fields if k.startswith('customfield_') and k not in _DYNAMIC_FIELD_EXCLUDE]
+    candidates += [k for k in _DYNAMIC_TOP_LEVEL_FIELDS if k in fields]
+
+    # Debug logging: show what was discovered
+    if candidates:
+        candidate_names = [field_name_map.get(c, c) for c in candidates]
+        logging.debug(f"[dynamic-fields] Discovered {len(candidates)} candidate field(s): {candidate_names}")
+
+    unresolved = {}
+    for jira_field_id in candidates:
+        raw_value = fields.get(jira_field_id)
+        if raw_value in (None, '', [], {}):
+            continue
+
+        display_name = field_name_map.get(jira_field_id) or _DYNAMIC_TOP_LEVEL_FIELDS.get(jira_field_id, jira_field_id)
+        str_value = _stringify_jira_custom_value(raw_value)
+        if str_value in (None, ''):
+            logging.debug(f"[dynamic-fields] Skipping {display_name}: stringified value is empty")
+            continue
+
+        if isinstance(raw_value, bool):
+            field_type = 'string'
+        elif isinstance(raw_value, int):
+            field_type = 'integer'
+        elif isinstance(raw_value, float):
+            field_type = 'double'
+        else:
+            field_type = 'string'
+
+        ado_ref = None
+        try:
+            ado_ref = ado_client.get_or_create_custom_field(
+                display_name, ado_type, field_type, exclude_ref_names=_RESERVED_ADO_FIELD_REFS
+            )
+            if ado_ref:
+                logging.debug(f"[dynamic-fields] Found/created field '{display_name}' → {ado_ref}")
+        except Exception as e:
+            logging.warning(f"[dynamic-fields] Discovery failed for '{display_name}': {e}")
+
+        if ado_ref:
+            try:
+                ado_client.update_field(ado_id, f'/fields/{ado_ref}', str_value)
+                logging.info(f"[dynamic-fields] ✅ {display_name} → {ado_ref} = {str_value!r}")
+                continue
+            except Exception as e:
+                logging.warning(f"[dynamic-fields] Could not write {ado_ref} on {ado_id}: {e}")
+        else:
+            # No usable ADO field (no match found, creation failed, or process isn't Inherited) —
+            # keep the information visible via the description instead of dropping it.
+            logging.info(f"[dynamic-fields] ⚠️  No matching ADO field found for '{display_name}' → adding to description fallback")
+            unresolved[display_name] = str_value
+            continue
+
+        # Should not reach here, but if somehow ado_ref exists but write fails, still keep in description
+        unresolved[display_name] = str_value
+
+    if unresolved:
+        logging.info(f"[dynamic-fields] Writing {len(unresolved)} unresolved field(s) to description on {ado_id}: {list(unresolved.keys())}")
+        _upsert_unmapped_fields_in_description(ado_id, ado_client, unresolved)
+
+
+def _upsert_unmapped_fields_in_description(ado_id: int, ado_client: AzureDevOpsClient, fields: dict):
+    """Idempotently upsert a 'Jira Custom Fields' block in the description for any
+    Jira field with no matching/creatable ADO field. Re-runs replace the block in
+    place instead of duplicating it.
+    """
+    _UNRESOLVED_DYNAMIC_FIELDS.update(fields.keys())
+    try:
+        item = ado_client.get_work_item_full(ado_id)
+        current_desc = (item or {}).get('fields', {}).get('System.Description') or ''
+    except Exception as e:
+        logging.warning(f"[dynamic-fields] Could not read description on {ado_id}: {e}")
+        return
+
+    # Build a clean, formatted HTML block for custom fields
+    block_lines = [
+        '<div style="background: #f5f5f5; border-left: 4px solid #0078d4; padding: 10px; margin: 10px 0;">',
+        '<p><strong>📋 Jira Custom Fields (no ADO equivalent):</strong></p>',
+        '<ul style="margin: 5px 0; padding-left: 20px;">',
+    ]
+    for name, value in fields.items():
+        # Escape HTML but preserve basic formatting
+        safe_value = str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        block_lines.append(f'<li><strong>{name}:</strong> {safe_value}</li>')
+    block_lines.extend([
+        '</ul>',
+        '</div>',
+    ])
+    new_block = _UNMAPPED_FIELDS_MARKER_START + ''.join(block_lines) + _UNMAPPED_FIELDS_MARKER_END
+
+    if _UNMAPPED_FIELDS_MARKER_START in current_desc:
+        pattern = re.compile(
+            re.escape(_UNMAPPED_FIELDS_MARKER_START) + '.*?' + re.escape(_UNMAPPED_FIELDS_MARKER_END),
+            re.DOTALL,
+        )
+        updated_desc = pattern.sub(new_block, current_desc)
+    else:
+        updated_desc = f'{current_desc}<br />{new_block}' if current_desc else new_block
+
+    if updated_desc != current_desc:
+        try:
+            ado_client.update_field(ado_id, '/fields/System.Description', updated_desc)
+            logging.info(f"[dynamic-fields] ✅ Added {len(fields)} field(s) to description block on {ado_id}")
+        except Exception as e:
+            logging.warning(f"[dynamic-fields] Could not update description on {ado_id}: {e}")
+
+
+_JIRA_STATUS_HISTORY_FIELD_NAME = 'Jira Status History'
+_STATUS_HISTORY_MARKER_START = '<!-- JIRA-STATUS-HISTORY-START -->'
+_STATUS_HISTORY_MARKER_END = '<!-- JIRA-STATUS-HISTORY-END -->'
+
+
+def sync_jira_status_history_field(ado_id: int, jira_ticket: dict, ado_type: str,
+                                   jira_client: JiraClient, ado_client: AzureDevOpsClient):
+    """Write Jira's full status-transition history into one structured ADO field.
+
+    ADO's native History tab only ever shows two kinds of entries: auto-generated
+    field-revision entries (today's date/current PAT identity only — can't be
+    backdated or re-attributed) and discussion comments (which always render as
+    generic "X added a comment", regardless of content). Neither can reproduce
+    Jira's clean "changed the Status: A → B" line with the *original* author/date,
+    and comments aren't queryable for state-duration metrics anyway.
+
+    Instead, every status transition (date, from, to, changed-by) is written as one
+    clean HTML table into a dedicated custom field (auto-discovered/created via
+    get_or_create_custom_field — same mechanism as sync_dynamic_custom_fields), so a
+    metrics tool can read a single field to compute time-in-state. The whole table is
+    regenerated on every run (not appended), so re-runs stay in sync automatically —
+    no dedup bookkeeping needed.
+    """
+    jira_key = jira_ticket.get('key', '')
+    try:
+        histories = jira_client.get_changelog(jira_key)
+    except Exception as e:
+        logging.warning(f"[status-history] Could not fetch changelog for {jira_key}: {e}")
+        return
+
+    transitions = []  # (created_iso, from_status, to_status, author)
+    for history in histories or []:
+        author = (history.get('author') or {}).get('displayName', 'Unknown')
+        created = history.get('created', '')
+        for item in history.get('items') or []:
+            if (item.get('field') or '').lower() != 'status':
+                continue
+            transitions.append((created, item.get('fromString') or '(none)', item.get('toString') or '(none)', author))
+    transitions.sort(key=lambda t: t[0])
+
+    if not transitions:
+        return  # item never changed status — nothing to record
+
+    rows = []
+    for created, from_s, to_s, author in transitions:
+        try:
+            date_str = ado_client.format_date(created)
+        except Exception:
+            date_str = created
+        rows.append(
+            f'<tr><td>{date_str}</td><td>{from_s}</td><td>{to_s}</td><td>{author}</td></tr>'
+        )
+    table_html = (
+        '<table border="1" style="border-collapse:collapse;width:100%">'
+        '<tr><th>Date</th><th>From</th><th>To</th><th>Changed By</th></tr>'
+        + ''.join(rows) + '</table>'
+    )
+
+    ado_ref = None
+    try:
+        ado_ref = ado_client.get_or_create_custom_field(_JIRA_STATUS_HISTORY_FIELD_NAME, ado_type, field_type='html')
+    except Exception as e:
+        logging.warning(f"[status-history] Field discovery failed: {e}")
+
+    if ado_ref:
+        try:
+            ado_client.update_field(ado_id, f'/fields/{ado_ref}', table_html)
+            logging.info(f"[status-history] \u2705 {jira_key}: wrote {len(transitions)} transition(s) to {ado_ref}")
+            return
+        except Exception as e:
+            logging.warning(f"[status-history] Could not write {ado_ref} on {ado_id}: {e}")
+
+    # No usable ADO field — fall back to an idempotent description block so the
+    # data isn't silently dropped.
+    try:
+        item = ado_client.get_work_item_full(ado_id)
+        current_desc = (item or {}).get('fields', {}).get('System.Description') or ''
+    except Exception as e:
+        logging.warning(f"[status-history] Could not read description on {ado_id}: {e}")
+        return
+    new_block = (
+        _STATUS_HISTORY_MARKER_START
+        + f'<p><b>{_JIRA_STATUS_HISTORY_FIELD_NAME}:</b></p>' + table_html
+        + _STATUS_HISTORY_MARKER_END
+    )
+    if _STATUS_HISTORY_MARKER_START in current_desc:
+        pattern = re.compile(
+            re.escape(_STATUS_HISTORY_MARKER_START) + '.*?' + re.escape(_STATUS_HISTORY_MARKER_END),
+            re.DOTALL,
+        )
+        updated_desc = pattern.sub(new_block, current_desc)
+    else:
+        updated_desc = f'{current_desc}<br />{new_block}' if current_desc else new_block
+    if updated_desc != current_desc:
+        try:
+            ado_client.update_field(ado_id, '/fields/System.Description', updated_desc)
+        except Exception as e:
+            logging.warning(f"[status-history] Could not update description on {ado_id}: {e}")
+
+
 
 
 def _ensure_board_preflight(ado_client, team_name: str) -> bool:
@@ -188,8 +508,8 @@ def load_config(filename: str):
     try:
         return json.loads(path.read_text())
     except Exception as e:
-        logging.error(f"[load_config] Could not read {filename}: {e}")
-        return None
+        logging.debug(f"[load_config] Could not read {filename}: {e} — using AI-only mode")
+        return {}  # Return empty dict instead of None for AI-only mode
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +565,19 @@ def find_existing_ado_work_item(jira_key: str, ado_client: AzureDevOpsClient, ma
 
 def build_parsed_fields(jira_ticket: dict, type_config: dict, state_config: dict):
     """Parse a Jira ticket dict and return the core ADO field values."""
-    jira_key = jira_ticket['key']
+    if not jira_ticket or not isinstance(jira_ticket, dict):
+        logging.error(f"[build_parsed_fields] Invalid jira_ticket: {type(jira_ticket)}")
+        return None, None, None, None, ''
+    
+    jira_key = jira_ticket.get('key', 'UNKNOWN')
+    fields = jira_ticket.get('fields') or {}
 
-    parent_key = jira_ticket['fields'].get('parent', {}).get('key')
+    parent_key = (fields.get('parent') or {}).get('key')
+    summary = fields.get('summary', 'No Summary')
     if parent_key:
-        title = f'[{parent_key}] [{jira_key}] {jira_ticket["fields"]["summary"]}'
+        title = f'[{parent_key}] [{jira_key}] {summary}'
     else:
-        title = f'[{jira_key}] {jira_ticket["fields"]["summary"]}'
+        title = f'[{jira_key}] {summary}'
 
     # ADO rejects titles over 255 chars; truncate and keep full text for description.
     _ADO_TITLE_MAX = 255
@@ -260,32 +586,58 @@ def build_parsed_fields(jira_ticket: dict, type_config: dict, state_config: dict
         title = title[:_ADO_TITLE_MAX - 1] + '…'
         logging.warning(f"[title] {jira_key}: title truncated to {_ADO_TITLE_MAX} chars (was {len(full_title)})")
 
-    assignee_field = jira_ticket['fields'].get('assignee') or {}
-    assignee_email = assignee_field.get('emailAddress', '')
-    assignee_name  = assignee_field.get('displayName', '')
+    assignee_field = (fields.get('assignee') or {})
+    assignee_email = assignee_field.get('emailAddress', '') if assignee_field else ''
+    assignee_name  = assignee_field.get('displayName', '') if assignee_field else ''
     # Use email when available; fall back to display name for archived projects
     assignee = assignee_email or assignee_name or None
 
-    state     = (jira_ticket['fields'].get('status') or {}).get('name', '')
-    jira_type = (jira_ticket['fields'].get('issuetype') or {}).get('name', '')
-    description = (jira_ticket.get('renderedFields') or {}).get('description') or ''
+    status_obj = (fields.get('status') or {})
+    state     = status_obj.get('name', '') if status_obj else ''
+    issuetype_obj = (fields.get('issuetype') or {})
+    jira_type = issuetype_obj.get('name', '') if issuetype_obj else ''
+    rendered_fields = (jira_ticket.get('renderedFields') or {})
+    description = (rendered_fields.get('description') or '') if rendered_fields else ''
 
     # Append customer info to description when present
-    customers = jira_ticket['fields'].get('customfield_10907')
+    customers = fields.get('customfield_10907')
     if customers:
         try:
             description += '<p><b>Customers:</b></p>'
-            customers_content = jira_ticket['fields']['customfield_10907']['content'][0]['content']
+            customers_content = (customers.get('content') or [{}])[0].get('content', [])
             for customer in customers_content:
-                description += f'{customer["text"]}<br />'
-        except Exception:
-            pass
+                if isinstance(customer, dict):
+                    description += f'{customer.get("text", "")}<br />'
+        except Exception as e:
+            logging.debug(f"[build_parsed_fields] Could not parse customers field: {e}")
 
+    # Map Jira type to ADO type; fallback to sensible defaults for AI-only mode
     if (ado_type := type_config.get(jira_type)) is None:
         ado_type = type_config.get('Default')
+    if ado_type is None:
+        # AI-only mode: no type_config.json; use sensible defaults
+        if jira_type in ('Story', 'Epic', 'Feature'):
+            ado_type = 'User Story'
+        elif jira_type in ('Task', 'Subtask', 'Sub-task'):
+            ado_type = 'Task'
+        elif jira_type in ('Bug', 'Incident'):
+            ado_type = 'Bug'
+        else:
+            ado_type = 'User Story'  # default fallback
 
+    # Map Jira state to ADO state; fallback to sensible defaults for AI-only mode
     if (ado_state := state_config.get(state)) is None:
         ado_state = state_config.get('Default')
+    if ado_state is None:
+        # AI-only mode: no state_config.json; use sensible defaults
+        if state in ('To Do', 'Backlog', 'Open', 'New'):
+            ado_state = 'New'
+        elif state in ('In Progress', 'In Development', 'In Test'):
+            ado_state = 'Active'
+        elif state in ('Done', 'Closed', 'Resolved'):
+            ado_state = 'Done'
+        else:
+            ado_state = 'New'  # default fallback
 
     return title, assignee, ado_type, ado_state, description
 
@@ -302,10 +654,16 @@ def sync_custom_fields(ado_id: int, jira_ticket: dict, ado_client: AzureDevOpsCl
     calls are idempotent for scalar fields.
     Each field update is isolated so one failure doesn't abort the others.
     """
+    if not jira_ticket or not isinstance(jira_ticket, dict):
+        logging.debug(f"[sync_custom_fields] Skipping invalid jira_ticket")
+        return
+    
+    fields = jira_ticket.get('fields') or {}
     for y in custom_fields:
-        if y['jira_field'] not in jira_ticket['fields']:
+        jira_field = y.get('jira_field')
+        if not jira_field or jira_field not in fields:
             continue
-        field = jira_ticket['fields'][y['jira_field']]
+        field = fields[jira_field]
         if field is None:
             continue  # skip null values — ADO rejects them with 400
 
@@ -378,8 +736,13 @@ def sync_attachments(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
     existing_names = set(existing_by_name.keys())
     attachment_dict = dict(existing_by_name)
 
-    for i in jira_ticket['fields']['attachment']:
-        filename   = i['filename']
+    fields = jira_ticket.get('fields') or {}
+    for i in (fields.get('attachment') or []):
+        if not isinstance(i, dict):
+            continue
+        filename   = i.get('filename')
+        if not filename:
+            continue
         # If this filename is already linked, reuse its URL for image rewrite and skip upload.
         if filename in existing_names:
             existing_url = existing_by_name.get(filename, '')
@@ -527,6 +890,9 @@ def sync_links(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
 
     Deduplication: checks existing relation URLs before adding anything.
     """
+    if not jira_ticket or not isinstance(jira_ticket, dict):
+        logging.debug(f"[sync_links] Skipping invalid jira_ticket")
+        return
     existing_urls = ado_client.get_work_item_relation_urls(ado_id)
 
     # ---- PR / branch links (always hyperlinks) ----
@@ -569,20 +935,27 @@ def sync_links(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
 
     # ---- Parent relationship (from Jira parent field) ----
     # Use .get() to guard against the key being present but set to None
-    if jira_ticket['fields'].get('parent'):
-        parent_key = jira_ticket['fields']['parent']['key']
-        _add_real_or_fallback(parent_key, 'System.LinkTypes.Hierarchy-Reverse')
+    fields = jira_ticket.get('fields') or {}
+    parent_obj = fields.get('parent')
+    if parent_obj:
+        parent_key = parent_obj.get('key') if isinstance(parent_obj, dict) else None
+        if parent_key:
+            _add_real_or_fallback(parent_key, 'System.LinkTypes.Hierarchy-Reverse')
 
     # ---- Inward / outward linked issues ----
-    for a in jira_ticket['fields'].get('issuelinks', []):
-        link_type_name = a.get('type', {}).get('name', '')
+    for a in (fields.get('issuelinks') or []):
+        if not isinstance(a, dict):
+            continue
+        link_type_name = (a.get('type') or {}).get('name', '')
         for direction, issue_obj in [
             ('outward', a.get('outwardIssue')),
             ('inward',  a.get('inwardIssue')),
         ]:
-            if issue_obj is None:
+            if issue_obj is None or not isinstance(issue_obj, dict):
                 continue
-            linked_key = issue_obj['key']
+            linked_key = issue_obj.get('key')
+            if not linked_key:
+                continue
             ado_relation_type = JIRA_TO_ADO_LINK_TYPES.get(
                 (link_type_name, direction),
                 'System.LinkTypes.Related'  # default for unrecognised types
@@ -629,6 +1002,12 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     title, assignee, ado_type, ado_state, description = build_parsed_fields(
         jira_ticket, type_config, state_config
     )
+    
+    # Handle case where build_parsed_fields failed to parse
+    if title is None:
+        logging.error(f"[create_or_update_work_item] Could not parse jira_ticket for {jira_key}")
+        return None
+    
     # Only write description body if the user selected the description field
     desc_to_write = description if _want('description') else None
 
@@ -637,12 +1016,15 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
 
     if ado_id:
         logging.info(f"[UPDATE] Updating existing ADO item {ado_id} for Jira {jira_key}")
-        ado_client.update_item_core_fields(ado_id, title, ado_state, None, desc_to_write)
-        # Always enforce the correct type — bypassRules=true required; idempotent if already correct
+        # Change type FIRST: if the item's stored System.State is invalid for the new
+        # type (e.g. re-typing to 'Task', whose states don't include 'Active'), setting
+        # state afterwards (with per-type validation) corrects it in the same call
+        # instead of leaving a poisoned state that fails every subsequent field PATCH.
         try:
             ado_client.change_work_item_type(ado_id, ado_type)
         except Exception as e:
             logging.warning(f"[type-change] Could not set type '{ado_type}' for {jira_key}: {e}")
+        ado_client.update_item_core_fields(ado_id, title, ado_state, None, desc_to_write, ado_type=ado_type)
     else:
         # Try the mapped type; if disabled in this project, fall back through _TYPE_FALLBACKS
         tried_types = [ado_type] + [t for t in _TYPE_FALLBACKS if t != ado_type]
@@ -716,13 +1098,54 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         # Iteration path — without this, items exist under the correct AreaPath
         # but never appear on the team's Kanban Board (Boards require IterationPath
         # to match one of the team's explicitly SELECTED iterations).
+        # Try to use the Jira sprint name if available; fall back to team's default iteration
         _iter_path = _TEAM_ITERATION_PATH.get(_ap_team)
-        if _iter_path:
+        
+        # Extract sprint name from Jira if available
+        _jira_fields_iter = jira_ticket.get('fields') or {}
+        _sprint_fields = _jira_fields_iter.get('customfield_10007') or []
+        _sprint_names = [s.get('name', '') for s in _sprint_fields if isinstance(s, dict) and s.get('name')]
+        
+        # If sprint exists, try to use it as the iteration path
+        if _sprint_names and _ap_team:
+            _sprint_name = _sprint_names[0]  # Use the active/first sprint
+            logging.info(f"[iteration-path] {jira_key}: Found Jira sprint: '{_sprint_name}'")
+            # Build iteration path: <project>\<team>\<sprint>
+            # Get the project name from the area path
+            if _iter_path and '\\' in _iter_path:
+                _project_and_team = _iter_path.rsplit('\\', 1)[0]
+                _proposed_iter = f"{_project_and_team}\\{_sprint_name}"
+                logging.info(f"[iteration-path] {jira_key}: Attempting to set: {_proposed_iter}")
+                try:
+                    ado_client.update_field(ado_id, '/fields/System.IterationPath', _proposed_iter)
+                    logging.info(f"[iteration-path] ✅ {jira_key} → Iteration: '{_sprint_name}'")
+                except Exception as _e:
+                    # Sprint might not exist in ADO — fall back to team's default
+                    logging.warning(f"[iteration-path] {jira_key}: Failed to set sprint '{_sprint_name}': {_e}")
+                    logging.info(f"[iteration-path] {jira_key}: Falling back to team default: {_iter_path}")
+                    if _iter_path:
+                        try:
+                            ado_client.update_field(ado_id, '/fields/System.IterationPath', _iter_path)
+                            logging.info(f"[iteration-path] ✅ {jira_key} → Team default: '{_iter_path}'")
+                        except Exception as _e2:
+                            logging.warning(f"[iteration-path] {jira_key}: Could not set team default: {_e2}")
+            else:
+                # Fall back to team iteration if we can't parse the path
+                logging.warning(f"[iteration-path] {jira_key}: Could not parse project/team from '{_iter_path}'")
+                if _iter_path:
+                    try:
+                        ado_client.update_field(ado_id, '/fields/System.IterationPath', _iter_path)
+                        logging.info(f"[iteration-path] ✅ {jira_key} → '{_iter_path}' (team default)")
+                    except Exception as _e:
+                        logging.warning(f"[iteration-path] {jira_key}: Could not set '{_iter_path}': {_e}")
+        elif _iter_path:
+            # No sprint in Jira — use team's default iteration
+            logging.debug(f"[iteration-path] {jira_key}: No Jira sprint — using team default")
             try:
                 ado_client.update_field(ado_id, '/fields/System.IterationPath', _iter_path)
-                logging.info(f"[iteration-path] \u2705 {jira_key} → '{_iter_path}'")
+                logging.info(f"[iteration-path] ✅ {jira_key} → '{_iter_path}' (team default)")
             except Exception as _e:
-                logging.warning(f"[iteration-path] \u274c Could not set '{_iter_path}' for {jira_key}: {_e}")
+                logging.warning(f"[iteration-path] {jira_key}: Could not set '{_iter_path}': {_e}")
 
     # ---- Assignee: set System.AssignedTo in ADO when possible ----
     # Try email first (exact match), then display name (ADO fuzzy resolve).
@@ -730,7 +1153,11 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     assignee_set_in_ado = False
     assignee_line = None
     if _want('assignee') and assignee:
-        display_name = jira_ticket['fields']['assignee']['displayName']
+        # Get display name from Jira ticket, with fallback
+        fields = jira_ticket.get('fields') or {}
+        assignee_obj = fields.get('assignee') or {}
+        display_name = assignee_obj.get('displayName', '') if isinstance(assignee_obj, dict) else ''
+        display_name = display_name or assignee  # fallback to assignee (email) if no displayName
         # Build candidate list: email (if different from display name) then display name
         candidates = []
         if assignee != display_name:
@@ -799,6 +1226,12 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     if _want('custom_fields'):
         logging.debug(f"[main] Updating custom fields for: {ado_id}")
         sync_custom_fields(ado_id, jira_ticket, ado_client, custom_fields)
+        # Dynamic discovery: map any Jira custom field (RICE scores, Fix Version, etc.)
+        # with no static config entry onto a matching/auto-created ADO field.
+        try:
+            sync_dynamic_custom_fields(ado_id, jira_ticket, ado_type, jira_client, ado_client)
+        except Exception as e:
+            logging.warning(f"[main] Dynamic custom field sync failed for {jira_key}: {e}")
         logging.debug(f"[main] Finished updating custom fields for: {ado_id}")
 
     # ---- Priority ----
@@ -831,7 +1264,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             local_date = dt.strftime('%Y-%m-%d')   # date as shown in Jira's UI
             return f'{local_date}T12:00:00.000Z'   # noon UTC → renders correctly in all US timezones
 
-        jira_fields = jira_ticket['fields']
+        jira_fields = jira_ticket.get('fields') or {}
 
         # Actual Start Date ← Jira created
         if ts := jira_fields.get('created'):
@@ -884,7 +1317,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             logging.warning(f"[dates] Unexpected error handling resolution date for {jira_key}: {e}")
 
     # ---- Labels / tags (merge, do not overwrite existing tags) ----
-    jira_fields = jira_ticket['fields']  # re-bind in case dates block was skipped
+    jira_fields = jira_ticket.get('fields') or {}  # re-bind in case dates block was skipped
     _want_labels = _want('labels')
     _want_sprint = _want('sprint')
     if _want_labels or _want_sprint:
@@ -931,6 +1364,15 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
     # ---- Comments ----
     if _want('comments'):
         sync_comments(ado_id, jira_id, jira_client, ado_client, attachment_dict)
+
+    # ---- Status history (for cycle-time/state-duration metrics) ----
+    # Written to a dedicated structured field, NOT comments — see
+    # sync_jira_status_history_field() docstring for why comments can't do this.
+    if _want('history'):
+        try:
+            sync_jira_status_history_field(ado_id, jira_ticket, ado_type, jira_client, ado_client)
+        except Exception as e:
+            logging.warning(f"[main] Status history sync failed for {jira_key}: {e}")
 
     # ---- Hyperlinks / linked issues ----
     if _want('links'):
@@ -1158,6 +1600,65 @@ def main():
             
             logging.info(f"[main] Dependency-sorted order: {sorted_keys}")
 
+            # AUTO-COLLECT CHILDREN: When a parent is migrated, include all its children too.
+            # IMPORTANT: Atlassian retired the legacy `GET /rest/api/3/search` endpoint (it now
+            # returns "410 Gone" on Cloud instances). search_jql_paginated() uses the current
+            # `POST /rest/api/3/search/jql` endpoint, which is what get_filter_items() already
+            # relies on successfully elsewhere in this codebase — use the same one here.
+            print(f'[bootstrap] Auto-collecting child items for {len(target_keys)} parent key(s)...')
+            children_to_add = set()
+            for jira_key in target_keys:
+                if jira_key not in jira_tickets_by_key:
+                    continue
+                try:
+                    search_result = jira_client.search_jql_paginated(f'parent = {jira_key}')
+                except Exception as e:
+                    logging.warning(f"[main] Child auto-collection failed for {jira_key}: {e}")
+                    search_result = None
+
+                child_issues = (search_result or {}).get('issues', [])
+                if child_issues:
+                    logging.info(f"[main] Found {len(child_issues)} children for {jira_key}")
+                else:
+                    logging.debug(
+                        f"[main] No children auto-collected for {jira_key}. If this item has "
+                        f"children in Jira, pass them explicitly: --jira-keys '{jira_key},CHILD1,CHILD2'"
+                    )
+
+                for child in child_issues:
+                    child_key = child.get('key')
+                    if not child_key or child_key in jira_tickets_by_key:
+                        continue
+                    try:
+                        child_ticket = jira_client.get_jira_issue(child_key)
+                    except Exception as e:
+                        logging.warning(f"[main] Could not fetch child {child_key}: {e}")
+                        continue
+                    if child_ticket:
+                        jira_tickets_by_key[child_key] = child_ticket
+                        children_to_add.add(child_key)
+                        logging.debug(f"[main] Auto-collected child: {child_key}")
+
+            if children_to_add:
+                print(f'[bootstrap] Auto-collected {len(children_to_add)} child item(s). Re-sorting with dependencies...')
+                # Re-sort to include children
+                sorted_keys_with_children = []
+                processed = set()
+                def add_with_deps(key):
+                    if key in processed or key not in jira_tickets_by_key:
+                        return
+                    ticket = jira_tickets_by_key[key]
+                    parent_key = (ticket.get('fields') or {}).get('parent', {}).get('key')
+                    if parent_key and parent_key not in processed:
+                        add_with_deps(parent_key)
+                    sorted_keys_with_children.append(key)
+                    processed.add(key)
+                
+                for key in sorted_keys + list(children_to_add):
+                    add_with_deps(key)
+                sorted_keys = sorted_keys_with_children
+                logging.info(f"[main] After auto-collecting children: {len(sorted_keys)} total keys to migrate")
+
             # Detect the Jira board name from the tickets (if not already set by --project-key)
             if not hasattr(args, '_detected_team') or not args._detected_team:
                 detected_board = detect_jira_board_from_keys(jira_tickets_by_key)
@@ -1226,7 +1727,7 @@ def main():
                     save_failed_issue(jira_key, str(e))
                     failed_items.append(jira_key)
 
-            print_run_summary(succeeded, failed_items, base_cmd)
+            print_run_summary(succeeded, failed_items, base_cmd, ado_client=ado_client)
             return
 
         # Check if jira_filter is actually a Jira issue key (e.g., DATA-1011)
@@ -1358,13 +1859,44 @@ def main():
             print(f'[bootstrap] All {len(filter_keys)} items will be placed under ADO team: "{args._detected_team}"')
         
         jira_tickets_by_key_filter = {t['key']: t for t in [x.get('_ticket') for x in jira_issues if x.get('_ticket')]}
+
+        # AUTO-COLLECT CHILDREN: filter results may not include every subtask/child of a
+        # migrated item (e.g. filter scoped to a status, or child lives outside the saved
+        # filter). Search Jira for children of every item in scope and pull them in too.
+        print(f'[bootstrap] Auto-collecting child items for {len(filter_keys)} key(s)...')
+        children_to_add_filter = set()
+        for jira_key in filter_keys:
+            try:
+                search_result = jira_client.search_jql_paginated(f'parent = {jira_key}')
+            except Exception as e:
+                logging.warning(f"[main] Child auto-collection failed for {jira_key}: {e}")
+                search_result = None
+
+            for child in (search_result or {}).get('issues', []):
+                child_key = child.get('key')
+                if not child_key or child_key in jira_tickets_by_key_filter:
+                    continue
+                try:
+                    child_ticket = jira_client.get_jira_issue(child_key)
+                except Exception as e:
+                    logging.warning(f"[main] Could not fetch child {child_key}: {e}")
+                    continue
+                if child_ticket:
+                    jira_tickets_by_key_filter[child_key] = child_ticket
+                    children_to_add_filter.add(child_key)
+                    logging.debug(f"[main] Auto-collected child: {child_key}")
+
+        if children_to_add_filter:
+            print(f'[bootstrap] Auto-collected {len(children_to_add_filter)} child item(s) not already in the filter results.')
+            filter_keys = filter_keys + list(children_to_add_filter)
+
         sorted_filter_keys = []
         processed_filter = set()
         def add_filter_with_deps(key):
             if key in processed_filter or key not in jira_tickets_by_key_filter:
                 return
             ticket = jira_tickets_by_key_filter[key]
-            parent_key = ticket['fields'].get('parent', {}).get('key')
+            parent_key = (ticket.get('fields') or {}).get('parent', {}).get('key')
             if parent_key and parent_key not in processed_filter:
                 add_filter_with_deps(parent_key)
             sorted_filter_keys.append(key)
@@ -1427,7 +1959,7 @@ def main():
                 clear_failed_issue(jira_key)
                 succeeded.append(jira_key)
 
-        print_run_summary(succeeded, failed_items, base_cmd)
+        print_run_summary(succeeded, failed_items, base_cmd, ado_client=ado_client)
 
     except Exception as e:
         logging.error(f"Error: {str(e)}")

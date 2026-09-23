@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import time
 import requests
 from requests import RequestException
 from dataclasses import dataclass
@@ -99,7 +100,7 @@ class AzureDevOpsClient:
         self.project = project
         #self.credentials = base64.b64encode(f":{config.credentials}".encode()).decode()
 
-    def ado_api_call(self, method, url, payload=None):
+    def ado_api_call(self, method, url, payload=None, _retry_on_state_error=True):
         # Makes a call to the Azure DevOps API with error handling
 
         auth = (self.username, self.access_token)
@@ -111,50 +112,115 @@ class AzureDevOpsClient:
         except TypeError:
             data = payload
 
-        try:
-            match method:
-                case 'GET':
-                    headers = {'Content-Type': 'application/json'}
-                case 'POST':
-                    headers = {'Content-Type': 'application/json'}
-                case 'POSTP':           # If method is POSTP, then the content-type must be json-patch or the REST API fails
-                    method = 'POST'
-                    headers = {'Content-Type': 'application/json-patch+json'}
-                case 'PATCH':
-                    headers = {'Content-Type': 'application/json-patch+json'}
-                case _:
-                    raise ValueError("Method must be either 'GET', 'POST', or 'PATCH'")
-            logging.debug(f"[ado_api_call] Making {method} request to {url}")
-            response = requests.request(method, auth=auth, url=url, headers=headers, data=data if payload else None)
+        match method:
+            case 'GET':
+                headers = {'Content-Type': 'application/json'}
+            case 'POST':
+                headers = {'Content-Type': 'application/json'}
+            case 'POSTP':           # If method is POSTP, then the content-type must be json-patch or the REST API fails
+                method = 'POST'
+                headers = {'Content-Type': 'application/json-patch+json'}
+            case 'PATCH':
+                headers = {'Content-Type': 'application/json-patch+json'}
+            case _:
+                raise ValueError("Method must be either 'GET', 'POST', or 'PATCH'")
 
-            # Raise an exception for HTTP error responses.
-            response.raise_for_status()
-            
-        except RequestException as e:
-            logging.error(f"[ado_api_call] Error: {response.status_code if response is not None else 'No response'} for url: {url}")
-            logging.error(f"[ado_api_call] Error response: {response.text if response is not None else 'No response'}")
-            if response is not None and response.status_code == 400 and 'VS402337' in response.text:
-                logging.error("[ado_api_call] Work item size limit exceeded")
-                raise WorkItemsSizeLimitExceeded()
-            # Extract the human-readable message from the ADO response body
-            if response is not None:
-                try:
-                    body = response.json()
-                    ado_msg = (body.get('message') or '').strip()
-                    if ado_msg:
-                        if 'VS403074' in ado_msg:
-                            m = re.search(r"work item type '([^']+)'", ado_msg, re.IGNORECASE)
-                            raise WorkItemTypeDisabledError(m.group(1) if m else 'unknown') from None
-                        raise RuntimeError(_friendly_ado_error(ado_msg)) from None
-                except (ValueError, AttributeError):
-                    pass
-            raise e
+        # Retry transient failures (no timeout previously meant a real ADO outage or a
+        # slow/stuck connection could hang forever or silently derail a multi-hour migration
+        # partway through). Connection errors/timeouts and 429/502/503/504 are retried with
+        # backoff; anything else (4xx validation errors, etc.) fails immediately as before.
+        _MAX_ATTEMPTS = 4
+        _BACKOFFS = [2, 5, 10]
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                logging.debug(f"[ado_api_call] Making {method} request to {url} (attempt {attempt + 1})")
+                response = requests.request(
+                    method, auth=auth, url=url, headers=headers,
+                    data=data if payload else None, timeout=60,
+                )
+                response.raise_for_status()
+                break  # success
+            except RequestException as e:
+                is_transient = response is None or response.status_code in (429, 502, 503, 504)
+                if is_transient and attempt < _MAX_ATTEMPTS - 1:
+                    wait = _BACKOFFS[min(attempt, len(_BACKOFFS) - 1)]
+                    status = response.status_code if response is not None else type(e).__name__
+                    logging.warning(
+                        f"[ado_api_call] Transient error ({status}) on {url} — "
+                        f"retrying in {wait}s (attempt {attempt + 1}/{_MAX_ATTEMPTS})"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                logging.error(f"[ado_api_call] Error: {response.status_code if response is not None else 'No response'} for url: {url}")
+                logging.error(f"[ado_api_call] Error response: {response.text if response is not None else 'No response'}")
+                if response is not None and response.status_code == 400 and 'VS402337' in response.text:
+                    logging.error("[ado_api_call] Work item size limit exceeded")
+                    raise WorkItemsSizeLimitExceeded()
+                # Extract the human-readable message from the ADO response body
+                if response is not None:
+                    try:
+                        body = response.json()
+                        ado_msg = (body.get('message') or '').strip()
+                        if ado_msg:
+                            if 'VS403074' in ado_msg:
+                                m = re.search(r"work item type '([^']+)'", ado_msg, re.IGNORECASE)
+                                raise WorkItemTypeDisabledError(m.group(1) if m else 'unknown') from None
+                            # Self-heal: a work item whose System.State is already invalid for its
+                            # CURRENT type (e.g. left over from an earlier bug, or after a type
+                            # change) fails FULL-DOCUMENT validation on every subsequent PATCH —
+                            # even ones that don't touch State at all (iteration path, dates, ...).
+                            # Repair the state once and retry this exact request instead of
+                            # letting every unrelated field update fail forever.
+                            if (_retry_on_state_error and method == 'PATCH'
+                                    and "field 'state'" in ado_msg.lower()
+                                    and 'not in the list of supported values' in ado_msg.lower()):
+                                m = re.search(r'/workitems/(\d+)\b', url)
+                                if m and self._repair_invalid_state(int(m.group(1))):
+                                    return self.ado_api_call(method, url, payload, _retry_on_state_error=False)
+                            raise RuntimeError(_friendly_ado_error(ado_msg)) from None
+                    except (ValueError, AttributeError):
+                        pass
+                raise e
 
         try:
             return response.json()
         except ValueError:
             logging.error(f"[ado_api_call] ValueError parsing response: {response}")
             return response
+
+    def _repair_invalid_state(self, item_id: int) -> bool:
+        """Best-effort self-heal for a work item whose System.State is invalid for its
+        current type. Resolves a valid state via resolve_valid_state() and PATCHes just
+        that field (bypassRules=true) so the item stops failing full-document validation
+        on every other field update. Returns True if a repair PATCH was sent.
+        """
+        try:
+            item = self.get_work_item_full(item_id)
+            fields = (item or {}).get('fields', {})
+            current_type  = fields.get('System.WorkItemType')
+            current_state = fields.get('System.State')
+            if not current_type or not current_state:
+                return False
+            fixed_state = self.resolve_valid_state(current_type, current_state)
+            if fixed_state == current_state:
+                return False  # already "valid" per our resolver — repairing again won't help
+            url = (
+                f'{self.organization_url}/{self.project}/_apis/wit/workitems/{item_id}'
+                f'?api-version={self.api_version}&bypassRules=true'
+            )
+            payload = [{'op': 'add', 'path': '/fields/System.State', 'value': fixed_state}]
+            requests.request(
+                'PATCH', url, auth=(self.username, self.access_token),
+                headers={'Content-Type': 'application/json-patch+json'},
+                data=json.dumps(payload),
+            ).raise_for_status()
+            logging.info(f"[state-repair] \u2705 {item_id}: invalid state '{current_state}' \u2192 '{fixed_state}' ({current_type})")
+            return True
+        except Exception as e:
+            logging.warning(f"[state-repair] Could not repair state on {item_id}: {e}")
+            return False
+
 
     def format_date(self, date_string):
         # Format a string from Jira into a date
@@ -249,20 +315,22 @@ class AzureDevOpsClient:
             return response
         
         # Other fields for the work item
+        resolved_state = self.resolve_valid_state(type, state)
         payload = [
             {
                 'op': 'add',
                 'path': '/fields/System.State',
-                'value': state
+                'value': resolved_state
             }
         ]
-        logging.debug(f"[create_item] Setting state to: {state}")
+        logging.debug(f"[create_item] Setting state to: {resolved_state}")
         try:
             response = self.ado_api_call('PATCH', url, payload)
         except RuntimeError as e:
             if 'State' in str(e) and 'not in the list of supported values' in str(e):
-                logging.warning(f"[create_item] State '{state}' not valid for this work item type — falling back to 'Active'")
-                payload[0]['value'] = 'Active'
+                fallback_state = self.resolve_valid_state(type, 'Active')
+                logging.warning(f"[create_item] State '{resolved_state}' not valid for this work item type — falling back to '{fallback_state}'")
+                payload[0]['value'] = fallback_state
                 response = self.ado_api_call('PATCH', url, payload)
             else:
                 raise
@@ -1006,8 +1074,76 @@ class AzureDevOpsClient:
             logging.warning(f"[configure_team_iteration] Error for team '{team_name}': {e}")
             return False
 
-    def update_item_core_fields(self, ado_id: int, title: str, state: str, assignee, description: str):
-        """Update the core editable fields of an existing work item in one PATCH call."""
+    def get_work_item_type_states(self, type_name: str) -> list[dict]:
+        """Return (and cache) the valid System.State values for a work item type in
+        self.project, e.g. [{'name': 'To Do', 'category': 'Proposed'}, ...].
+
+        Different processes/types have completely different state sets (Task in the
+        Agile process has 'To Do'/'In Progress'/'Done' — no 'Active' at all — while
+        User Story has 'New'/'Active'/'Resolved'/'Closed'), so state values can never
+        be hardcoded across types.
+        """
+        cache = getattr(self, '_wit_states_cache', None)
+        if cache is None:
+            cache = {}
+            self._wit_states_cache = cache
+        if type_name in cache:
+            return cache[type_name]
+        url = (
+            f'{self.organization_url}/{quote(self.project)}'
+            f'/_apis/wit/workitemtypes/{quote(type_name)}/states?api-version=7.0'
+        )
+        try:
+            resp = self.ado_api_call('GET', url)
+            states = (resp or {}).get('value', [])
+        except Exception as e:
+            logging.warning(f"[get_work_item_type_states] Could not fetch states for '{type_name}': {e}")
+            states = []
+        cache[type_name] = states
+        return states
+
+    def resolve_valid_state(self, type_name: str, desired_state: str) -> str:
+        """Map *desired_state* onto a state that's actually valid for *type_name*.
+
+        Falls back by state category (Proposed/InProgress/Resolved/Completed) when
+        the exact name doesn't exist on this type, instead of assuming a fixed name
+        like 'Active' is universally valid (it often isn't — e.g. Task states).
+        """
+        states = self.get_work_item_type_states(type_name)
+        if not states:
+            return desired_state  # can't validate — pass through unchanged
+        names = [s.get('name', '') for s in states if s.get('name')]
+        desired_lower = (desired_state or '').strip().lower()
+        for n in names:
+            if n.lower() == desired_lower:
+                return n
+
+        def first_in_category(cat: str):
+            for s in states:
+                if (s.get('category') or '').lower() == cat.lower():
+                    return s.get('name')
+            return None
+
+        if desired_lower in ('new', 'to do', 'open', 'backlog', 'proposed'):
+            return first_in_category('Proposed') or (names[0] if names else desired_state)
+        if desired_lower in ('active', 'in progress', 'doing', 'committed'):
+            return first_in_category('InProgress') or (names[0] if names else desired_state)
+        if desired_lower in ('done', 'closed', 'resolved', 'completed'):
+            return first_in_category('Completed') or first_in_category('Resolved') or (names[-1] if names else desired_state)
+        return names[0] if names else desired_state
+
+    def update_item_core_fields(self, ado_id: int, title: str, state: str, assignee, description: str,
+                                ado_type: str = None):
+        """Update the core editable fields of an existing work item in one PATCH call.
+
+        Pass ado_type (the work item's CURRENT type) so *state* can be validated/
+        remapped against that type's actual state set before sending — prevents the
+        "field 'State' ... not in the list of supported values" 400 that otherwise
+        poisons the item (every subsequent PATCH to it fails full-document validation
+        until the invalid state is corrected).
+        """
+        if ado_type:
+            state = self.resolve_valid_state(ado_type, state)
         url = (
             f'{self.organization_url}/{self.project}/_apis/wit/workitems/{ado_id}'
             f'?api-version={self.api_version}'
@@ -1027,10 +1163,11 @@ class AzureDevOpsClient:
             return self.ado_api_call('PATCH', url, payload)
         except RuntimeError as e:
             if 'State' in str(e) and 'not in the list of supported values' in str(e):
-                logging.warning(f"[update_item_core_fields] State '{state}' not valid for this work item type — falling back to 'Active'")
+                fallback_state = self.resolve_valid_state(ado_type, 'Active') if ado_type else 'Active'
+                logging.warning(f"[update_item_core_fields] State '{state}' not valid for this work item type — falling back to '{fallback_state}'")
                 for op in payload:
                     if op.get('path') == '/fields/System.State':
-                        op['value'] = 'Active'
+                        op['value'] = fallback_state
                 return self.ado_api_call('PATCH', url, payload)
             raise
 
@@ -1099,10 +1236,323 @@ class AzureDevOpsClient:
             logging.error(f"[ensure_jira_key_tag] Error adding jiraKey tag to {ado_id}: {e}")
             return False
 
+    # -----------------------------------------------------------------------
+    # Dynamic custom-field discovery / creation
+    # -----------------------------------------------------------------------
+    # Lets the migration map ANY Jira custom field (RICE scores, Fix Version,
+    # etc.) onto an ADO field without a static config file: look for an
+    # existing ADO field with a matching name first; if none exists, try to
+    # create one (org-level field + attach to the work item type). If field
+    # creation isn't possible (e.g. the project uses a non-Inherited process,
+    # or the PAT lacks permission), the caller falls back to the description.
 
-# ---------------------------------------------------------------------------
-# Type-config validation (used by the API preflight check, not the migration script)
-# ---------------------------------------------------------------------------
+    def get_all_fields(self) -> list[dict]:
+        """Return (and cache) every field defined in the organization."""
+        if getattr(self, '_all_fields_cache', None) is not None:
+            return self._all_fields_cache
+        url = f'{self.organization_url}/_apis/wit/fields?api-version=7.0'
+        try:
+            resp = self.ado_api_call('GET', url)
+            self._all_fields_cache = (resp or {}).get('value', [])
+        except Exception as e:
+            logging.warning(f"[get_all_fields] Could not list organization fields: {e}")
+            self._all_fields_cache = []
+        return self._all_fields_cache
+
+    _FIELD_NAME_STOPWORDS = {'estimate', 'field', 'the', 'of', 'a', 'an', 'value'}
+    
+    # Known Jira → ADO field mappings for common fields that have different names
+    _KNOWN_FIELD_MAPPINGS = {
+        'story point estimate': 'Story Points',
+        'story points': 'Story Points',
+        'fix version': 'Fix Versions',
+        'fix versions': 'Fix Versions',
+        'affects version': 'Affected Versions',
+        'affects versions': 'Affected Versions',
+        'label': 'System.Tags',
+        'labels': 'System.Tags',
+    }
+
+    @classmethod
+    def _field_name_tokens(cls, name: str) -> set:
+        """Normalize a display name into a comparable token set: lowercase, strip
+        punctuation, drop filler words, crude de-pluralize. Used for a last-resort
+        fuzzy match (e.g. Jira 'Story point estimate' vs ADO 'Story Points').
+        """
+        words = re.findall(r'[a-z0-9]+', (name or '').lower())
+        tokens = set()
+        for w in words:
+            if w in cls._FIELD_NAME_STOPWORDS:
+                continue
+            tokens.add(w[:-1] if len(w) > 3 and w.endswith('s') else w)
+        return tokens
+
+    def find_field_by_name(self, display_name: str, exclude_ref_names: set | None = None) -> str | None:
+        """Match an existing ADO field by display name. Returns referenceName or None.
+
+        *exclude_ref_names* lets callers keep this generic matcher from ever returning
+        a field the migration already manages via dedicated logic elsewhere (e.g.
+        Custom.ActualStartDate, which is populated from Jira's system 'created' date,
+        NOT from an unrelated Jira custom field that merely has a similar name).
+        """
+        if not display_name:
+            return None
+        exclude_ref_names = exclude_ref_names or set()
+        target = display_name.strip().lower()
+        
+        # Step 1: Check if there's a known mapping for this Jira field name
+        if target in self._KNOWN_FIELD_MAPPINGS:
+            expected_ado_name = self._KNOWN_FIELD_MAPPINGS[target]
+            fields = self.get_all_fields()
+            for f in fields:
+                if (f.get('name') or '').strip().lower() == expected_ado_name.lower():
+                    ref = f.get('referenceName')
+                    if ref not in exclude_ref_names:
+                        import logging as _logging
+                        _logging.debug(f"[find_field_by_name] Matched '{display_name}' → '{expected_ado_name}' ({ref}) via known mapping")
+                        return ref
+        
+        fields = [f for f in self.get_all_fields() if f.get('referenceName') not in exclude_ref_names]
+        
+        # Step 2: Exact match
+        for f in fields:
+            if (f.get('name') or '').strip().lower() == target:
+                import logging as _logging
+                _logging.debug(f"[find_field_by_name] Matched '{display_name}' → '{f.get('name')}' ({f.get('referenceName')}) via exact match")
+                return f.get('referenceName')
+        
+        # Step 3: Loose contains-match (handles "Fix Version" vs "Fix Version/s", etc.)
+        for f in fields:
+            fname = (f.get('name') or '').strip().lower()
+            if fname and (target in fname or fname in target):
+                import logging as _logging
+                _logging.debug(f"[find_field_by_name] Matched '{display_name}' → '{f.get('name')}' ({f.get('referenceName')}) via contains-match")
+                return f.get('referenceName')
+        
+        # Step 4: Token-overlap fuzzy match (handles "Story point estimate" vs "Story Points")
+        target_tokens = self._field_name_tokens(display_name)
+        if target_tokens:
+            best_match = None
+            best_overlap = 0
+            best_field_name = None
+            for f in fields:
+                fname = f.get('name') or ''
+                f_tokens = self._field_name_tokens(fname)
+                if not f_tokens:
+                    continue
+                overlap = len(target_tokens & f_tokens) / min(len(target_tokens), len(f_tokens))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match = f.get('referenceName')
+                    best_field_name = fname
+                if best_overlap >= 0.75:
+                    import logging as _logging
+                    _logging.debug(f"[find_field_by_name] Matched '{display_name}' → '{best_field_name}' ({best_match}) via token-fuzzy (overlap={best_overlap:.2f})")
+                    return best_match
+            if best_overlap >= 0.75:
+                import logging as _logging
+                _logging.debug(f"[find_field_by_name] Matched '{display_name}' → '{best_field_name}' ({best_match}) via token-fuzzy (overlap={best_overlap:.2f})")
+                return best_match
+        
+        import logging as _logging
+        _logging.debug(f"[find_field_by_name] No match found for '{display_name}' in {len(fields)} searchable ADO fields")
+        return None
+
+    def get_process_id_for_project(self) -> str | None:
+        """Return the process template GUID backing self.project, or None if it can't be determined."""
+        if getattr(self, '_process_id_cache', None) is not None:
+            return self._process_id_cache or None
+
+        def _fetch_capabilities(project_ref: str):
+            # NOTE: the correct Core API path is "_apis/projects/{project}" — there is
+            # no "/core/" segment. That typo used to 404 silently here, which made
+            # dynamic custom-field creation appear "broken" for every project.
+            url = (
+                f'{self.organization_url}/_apis/projects/{quote(project_ref)}'
+                f'?includeCapabilities=true&api-version=7.0'
+            )
+            resp = self.ado_api_call('GET', url)
+            return (
+                (resp or {}).get('capabilities', {})
+                .get('processTemplate', {})
+                .get('templateTypeId')
+            )
+
+        try:
+            process_id = _fetch_capabilities(self.project)
+        except Exception as e:
+            logging.debug(f"[get_process_id_for_project] Lookup by name failed for '{self.project}' ({e}) — retrying by project ID")
+            process_id = None
+            # Some orgs 404 on core/projects/{name} for names with spaces/special
+            # characters — fall back to listing all projects and matching by name,
+            # then re-query capabilities using the project's GUID.
+            try:
+                list_url = f'{self.organization_url}/_apis/projects?api-version=7.0&$top=1000'
+                resp = self.ado_api_call('GET', list_url)
+                for p in (resp or {}).get('value', []):
+                    if (p.get('name') or '').strip().lower() == self.project.strip().lower():
+                        process_id = _fetch_capabilities(p['id'])
+                        break
+            except Exception as e2:
+                logging.warning(f"[get_process_id_for_project] Could not resolve process for '{self.project}': {e2}")
+
+        self._process_id_cache = process_id or ''
+        return process_id
+
+    def get_work_item_type_ref_name(self, type_name: str) -> str | None:
+        """Return the process referenceName for a work item type (e.g. 'Microsoft.VSTS.WorkItemTypes.UserStory')."""
+        cache = getattr(self, '_wit_ref_cache', None)
+        if cache is None:
+            cache = {}
+            self._wit_ref_cache = cache
+        if type_name in cache:
+            return cache[type_name]
+        url = (
+            f'{self.organization_url}/{quote(self.project)}'
+            f'/_apis/wit/workitemtypes/{quote(type_name)}?api-version=7.0'
+        )
+        try:
+            resp = self.ado_api_call('GET', url)
+            ref_name = (resp or {}).get('referenceName')
+            cache[type_name] = ref_name
+            return ref_name
+        except Exception as e:
+            logging.debug(f"[get_work_item_type_ref_name] Could not resolve type '{type_name}': {e}")
+            cache[type_name] = None
+            return None
+
+    def create_org_field(self, display_name: str, field_type: str = 'string') -> str | None:
+        """Create a new organization-level field. Returns its referenceName, or None on failure."""
+        if getattr(self, '_field_creation_blocked', False):
+            # Already confirmed the PAT/account lacks 'Edit process' permission this run —
+            # don't retry (and don't spam the log) for every remaining field.
+            return None
+        ref_name = 'Custom.' + re.sub(r'[^A-Za-z0-9]', '', display_name.title())
+        url = f'{self.organization_url}/_apis/wit/fields?api-version=7.0'
+        payload = {
+            'name': display_name,
+            'referenceName': ref_name,
+            'type': field_type,
+            'description': 'Auto-created by Jira→ADO migration for a Jira custom field.',
+            'usage': 'workItem',
+        }
+        try:
+            resp = self.ado_api_call('POST', url, payload)
+            created_ref = (resp or {}).get('referenceName', ref_name)
+            logging.info(f"[create_org_field] ✅ Created ADO field '{display_name}' → {created_ref}")
+            # Invalidate the field list cache so subsequent lookups see the new field
+            self._all_fields_cache = None
+            return created_ref
+        except Exception as e:
+            msg = str(e)
+            if 'already exists' in msg.lower() or 'VS402903' in msg:
+                logging.debug(f"[create_org_field] Field '{display_name}' already exists — reusing {ref_name}")
+                return ref_name
+            if 'VS402356' in msg or 'do not have the permissions' in msg.lower():
+                self._field_creation_blocked = True
+                logging.warning(
+                    f"[create_org_field] ❌ Account/PAT lacks 'Edit process' permission — "
+                    f"cannot auto-create ADO fields this run (first blocked field: '{display_name}'). "
+                    f"Values will be preserved in each item's description instead."
+                )
+                return None
+            logging.warning(f"[create_org_field] Could not create field '{display_name}': {e}")
+            return None
+
+    def field_creation_blocked(self) -> bool:
+        """True if this run already hit a permission error trying to create a custom field."""
+        return getattr(self, '_field_creation_blocked', False)
+
+    def add_field_to_work_item_type(self, wit_type_name: str, field_ref_name: str) -> bool:
+        """Attach an existing org-level field to a work item type via the Process API.
+
+        Only works when the project's process is Inherited; returns False (and logs once)
+        for out-of-the-box (System) processes, which don't support field customization here.
+        """
+        process_id = self.get_process_id_for_project()
+        wit_ref    = self.get_work_item_type_ref_name(wit_type_name)
+        if not process_id or not wit_ref:
+            return False
+        url = (
+            f'{self.organization_url}/_apis/work/processes/{process_id}'
+            f'/workItemTypes/{wit_ref}/fields?api-version=7.0'
+        )
+        payload = {'referenceName': field_ref_name, 'required': False}
+        try:
+            self.ado_api_call('POST', url, payload)
+            logging.info(f"[add_field_to_work_item_type] ✅ Attached {field_ref_name} to '{wit_type_name}'")
+            return True
+        except Exception as e:
+            msg = str(e)
+            if 'already' in msg.lower():
+                return True  # already attached — treat as success
+            logging.warning(
+                f"[add_field_to_work_item_type] Could not attach {field_ref_name} to '{wit_type_name}' "
+                f"(process may not be Inherited): {e}"
+            )
+            return False
+
+    def get_or_create_custom_field(self, display_name: str, wit_type_name: str,
+                                   field_type: str = 'string',
+                                   exclude_ref_names: set | None = None) -> str | None:
+        """Resolve a Jira custom field name to a usable ADO field reference.
+
+        1. Reuse an already-discovered/created field for this display_name (per-run cache).
+        2. Look for an existing ADO field with a matching name (excluding any reference
+           names the caller says are already spoken for by other, unrelated logic).
+        3. Otherwise, try to create one and attach it to *wit_type_name*.
+        Returns None if no field is usable — caller should fall back to description text.
+        """
+        cache = getattr(self, '_dynamic_field_cache', None)
+        if cache is None:
+            cache = {}
+            self._dynamic_field_cache = cache
+        cache_key = f'{display_name}::{wit_type_name}'
+        if cache_key in cache:
+            logging.debug(f"[get_or_create_custom_field] Using cached result for '{display_name}': {cache[cache_key]}")
+            return cache[cache_key]
+
+        ref_name = self.find_field_by_name(display_name, exclude_ref_names=exclude_ref_names)
+        if ref_name:
+            logging.info(f"[get_or_create_custom_field] ✅ Found existing ADO field for '{display_name}': {ref_name}")
+        else:
+            logging.debug(f"[get_or_create_custom_field] No existing field for '{display_name}' — attempting to create")
+            ref_name = self.create_org_field(display_name, field_type)
+            if ref_name:
+                logging.info(f"[get_or_create_custom_field] ✅ Created new ADO field for '{display_name}': {ref_name}")
+            else:
+                logging.warning(f"[get_or_create_custom_field] ❌ Could not create field for '{display_name}'")
+        
+        # Belt-and-suspenders: even a freshly-created field's auto-generated reference
+        # name could coincidentally collide with a reserved one (e.g. Jira field named
+        # "Priority Level" -> "Custom.PriorityLevel"). Never hand back a reserved ref.
+        if ref_name and exclude_ref_names and ref_name in exclude_ref_names:
+            logging.warning(
+                f"[get_or_create_custom_field] '{display_name}' resolved to reserved field "
+                f"{ref_name} — refusing to reuse it; falling back to description."
+            )
+            ref_name = None
+        if ref_name and not self.add_field_to_work_item_type(wit_type_name, ref_name):
+            # Field exists at the org level but couldn't be attached to this work item
+            # type — writing to it would 400. Treat as unusable for this type.
+            logging.warning(f"[get_or_create_custom_field] Could not attach {ref_name} to '{wit_type_name}'")
+            ref_name = None
+
+        cache[cache_key] = ref_name
+        logging.debug(f"[get_or_create_custom_field] Final result for '{display_name}': {ref_name}")
+        return ref_name
+
+    def get_work_item_revisions(self, ado_id: int) -> list:
+        """Return all revisions (history) of a work item — read-only, used for diagnostics."""
+        url = f'{self.organization_url}/{self.project}/_apis/wit/workitems/{ado_id}/revisions?api-version=7.0'
+        try:
+            resp = self.ado_api_call('GET', url)
+            return (resp or {}).get('value', [])
+        except Exception as e:
+            logging.warning(f"[get_work_item_revisions] Could not fetch revisions for {ado_id}: {e}")
+            return []
+
+
 
 # Semantic fallback chains: for each Jira type, preferred ADO equivalents in order.
 _TYPE_FALLBACKS: dict[str, list[str]] = {

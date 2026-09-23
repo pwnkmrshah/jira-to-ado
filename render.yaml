@@ -1,26 +1,41 @@
-services:
-  # Backend API Service
-  - type: web
-    name: jira-to-ado-api
-    runtime: docker
-    dockerfilePath: Dockerfile.backend
-    envVars:
-      - key: FLASK_ENV
-        value: production
-      - key: PORT
-        value: 10000
-      - key: MIGRATION_API_KEY
-        sync: false  # Keep as secret, set in Render dashboard
-      - key: CORS_ALLOWED_ORIGINS
-        value: "*"
+# ⚠️  RENDER.COM DEPLOYMENT CONFIG — NOT USED
+# This file is deprecated and kept only for reference/future cloud deployments.
+# DO NOT USE — For local development, use docker-compose.yml instead.
+#
+# If you ever deploy to Render.com in the future:
+# 1. Update REACT_APP_API_URL to point to your actual Render backend service
+# 2. Set MIGRATION_API_KEY and GPT_API_KEY as secrets in Render dashboard
+# 3. Ensure .env is NOT checked into git
+#
+# For now, all development uses:
+#   docker-compose.yml (local Docker Compose with localhost:3000 and localhost:10000)
 
-  # Frontend UI Service  
-  - type: web
-    name: jira-to-ado-web
-    runtime: docker
-    dockerfilePath: Dockerfile.frontend
-    envVars:
-      - key: REACT_APP_API_URL
-        value: https://jira-to-ado-api.onrender.com  # Points to backend service
-      - key: PORT
-        value: 3000
+# services:
+#   # Backend API Service
+#   - type: web
+#     name: jira-to-ado-api
+#     runtime: docker
+#     dockerfilePath: Dockerfile.backend
+#     envVars:
+#       - key: FLASK_ENV
+#         value: production
+#       - key: PORT
+#         value: 10000
+#       - key: MIGRATION_API_KEY
+#         sync: false
+#       - key: CORS_ALLOWED_ORIGINS
+#         value: "*"
+#       - key: GPT_API_KEY
+#         sync: false
+#
+#   # Frontend UI Service  
+#   - type: web
+#     name: jira-to-ado-web
+#     runtime: docker
+#     dockerfilePath: Dockerfile.frontend
+#     envVars:
+#       - key: REACT_APP_API_URL
+#         value: https://jira-to-ado-api.onrender.com
+#       - key: PORT
+#         value: 3000
+

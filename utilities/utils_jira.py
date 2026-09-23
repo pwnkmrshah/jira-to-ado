@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from requests.exceptions import RequestException
 from dataclasses import dataclass
@@ -65,21 +66,33 @@ class JiraClient:
         #logger.info(f'Payload Sent = {payload}')
         #logger.info('')
 
-        try:
-            # Make GET or POST request based on the specified method.
-            if method == 'GET':
-                response = requests.request('GET', url, auth=auth, headers=headers, params=payload)
-            elif method == 'POST':
-                response = requests.request('POST', url, auth=auth, headers=headers, data=json.dumps(payload) if payload else None)
-            else:
-                raise ValueError("Method must be either 'GET' or 'POST'")
+        # Retry transient failures (connection errors/timeouts, 429/502/503/504) with backoff
+        # instead of letting a brief Jira/network blip silently kill or stall the whole run.
+        _MAX_ATTEMPTS = 4
+        _BACKOFFS = [2, 5, 10]
+        response = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                if method == 'GET':
+                    response = requests.request('GET', url, auth=auth, headers=headers, params=payload, timeout=60)
+                elif method == 'POST':
+                    response = requests.request('POST', url, auth=auth, headers=headers,
+                                                data=json.dumps(payload) if payload else None, timeout=60)
+                else:
+                    raise ValueError("Method must be either 'GET' or 'POST'")
 
-            # Raise an exception for HTTP error responses.
-            response.raise_for_status()
-        
-        except RequestException as e:   
-            logger.error(f"Failed to connect to JIRA: {str(e)}")
-            return None
+                response.raise_for_status()
+                break  # success
+            except RequestException as e:
+                is_transient = response is None or response.status_code in (429, 502, 503, 504)
+                if is_transient and attempt < _MAX_ATTEMPTS - 1:
+                    wait = _BACKOFFS[min(attempt, len(_BACKOFFS) - 1)]
+                    status = response.status_code if response is not None else type(e).__name__
+                    logger.warning(f"[jira_api_call] Transient error ({status}) on {url} — retrying in {wait}s (attempt {attempt + 1}/{_MAX_ATTEMPTS})")
+                    time.sleep(wait)
+                    continue
+                logger.error(f"Failed to connect to JIRA: {str(e)}")
+                return None
 
         try:
             return response.json()
@@ -134,6 +147,7 @@ class JiraClient:
         
         Returns:
             Response dict with 'issues' key containing list of issues, each with 'key' field
+            Returns {'issues': []} on error to prevent NoneType crashes
         """
         url = f'{self.server}/rest/api/3/search'
         payload = {
@@ -147,11 +161,15 @@ class JiraClient:
             response = self.jira_api_call('GET', url, payload)
             if response:
                 logger.info(f"[search_issues] JQL '{jql}' returned {len(response.get('issues', []))} issues")
-            return response
+                return response
+            else:
+                # HTTP error occurred (logged by jira_api_call) — return empty results instead of None
+                logger.warning(f"[search_issues] JQL query failed (HTTP error): '{jql}' — returning empty results")
+                return {'issues': []}
 
         except Exception as e:
             logger.error(f"Unexpected error while executing JQL '{jql}': {str(e)}")
-            return None
+            return {'issues': []}
 
     def search_jql_paginated(self, jql: str) -> dict | None:
         """Fetch ALL issues matching a JQL via POST /rest/api/3/search/jql with nextPageToken pagination.
@@ -233,3 +251,41 @@ class JiraClient:
             
         except Exception as e:
             logger.error(f"Unexpected error while retrieving html comments: {str(e)}")
+
+    def get_changelog(self, issue_key):
+        """Fetch the full field-change history (changelog) for an issue.
+
+        Returns a list of history entries, each shaped like:
+          {'id', 'author': {...}, 'created', 'items': [{'field','fromString','toString',...}, ...]}
+        Paginates via startAt since a single issue can have hundreds of changes.
+        """
+        all_histories = []
+        start_at = 0
+        max_results = 100
+        while True:
+            url = f'{self.server}/rest/api/3/issue/{issue_key}/changelog'
+            payload = {'startAt': start_at, 'maxResults': max_results}
+            response = self.jira_api_call('GET', url, payload)
+            if not response:
+                break
+            histories = response.get('values', [])
+            all_histories.extend(histories)
+            if response.get('isLast', True) or not histories:
+                break
+            start_at += len(histories)
+        return all_histories
+
+    def get_field_metadata(self):
+        """Return field id->name metadata for every field in this Jira instance:
+        [{'id': 'customfield_10007', 'name': 'Sprint', 'custom': True, ...}, ...]
+        Used to resolve customfield_XXXXX ids to human-readable names for dynamic
+        field mapping (e.g. "Fix versions", "RICE Reach") without a static config.
+        """
+        url = f'{self.server}/rest/api/3/field'
+        try:
+            response = self.jira_api_call('GET', url)
+            return response or []
+        except Exception as e:
+            logger.error(f"Unexpected error while retrieving field metadata: {str(e)}")
+            return []
+

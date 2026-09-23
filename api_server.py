@@ -127,6 +127,7 @@ _LIVE_LOG_PREFIXES = (
 def _categorize_error(rc: int, stdout_lines: list, error_lines: list) -> str:
     """Return a short, user-facing message based on what actually went wrong."""
     combined = ' '.join(error_lines + stdout_lines[-10:]).lower()
+    all_stdout = ' '.join(stdout_lines).lower()
 
     if 'filter' in combined and ('not found' in combined or '404' in combined or 'not accessible' in combined):
         import re as _re
@@ -135,10 +136,18 @@ def _categorize_error(rc: int, stdout_lines: list, error_lines: list) -> str:
         return (f'Filter ID {fid} was not found.' if fid else 'Filter not found.') + \
                ' Please double-check the number and make sure the filter is shared with your account in Jira.'
 
-    if any(x in combined for x in ('401', '403', 'unauthorized', 'forbidden', 'invalid token', 'authentication')):
+    # Did ANY item actually get created/updated/found in ADO this run? If so, the
+    # credentials are clearly valid — an isolated 401/403 on one optional/best-effort
+    # operation (e.g. dynamic custom-field creation needing elevated PAT scope) must not
+    # be reported as "your token may be expired", which is misleading once real work
+    # has already succeeded.
+    had_success = bool(re.search(r'\[(create|update|duplicate prevented)\]', all_stdout)) or \
+                  bool(re.search(r'\d+ processed: [1-9]\d* succeeded', all_stdout))
+
+    if not had_success and any(x in combined for x in ('401', '403', 'unauthorized', 'forbidden', 'invalid token', 'authentication')):
         return 'Access denied — your Jira API token or ADO token may be expired or incorrect. Please check your credentials.'
 
-    if any(x in combined for x in ('connection refused', 'timed out', 'could not connect', 'name or service not known')):
+    if not had_success and any(x in combined for x in ('connection refused', 'timed out', 'could not connect', 'name or service not known')):
         return 'Could not reach Jira or Azure DevOps. Please check your internet connection and try again.'
 
     if rc == 0 and error_lines:
@@ -153,6 +162,7 @@ def _categorize_error(rc: int, stdout_lines: list, error_lines: list) -> str:
 
 # Keep old name as alias so existing callers still work
 _summarise_errors = lambda lines: _categorize_error(0, [], lines)
+
 
 
 def _drain_pipe(pipe, buf: list, job_id: str, stream: str):
@@ -399,6 +409,12 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
                 except Exception as _e:
                     logging.warning(f"[{job_id}] Failed to read verify CSV: {_e}")
 
+        # Once the CSV downgrade proves everything actually verified, the error_summary
+        # computed from raw log text would be stale/misleading — e.g. "Access denied"
+        # from one incidental 401/403 on a best-effort operation. Don't surface it once
+        # ground truth (the verify CSV) says the run is actually clean.
+        error_summary = '' if final_status == 'completed' else _categorize_error(rc, stdout_buf, error_lines)
+
         with _jobs_lock:
             _jobs[job_id].update({
                 'status': final_status,
@@ -406,7 +422,7 @@ def _run_job(job_id: str, cmd: list, cwd: str, env_overrides: dict = None):
                 # Store only the actionable error lines so the frontend can show them cleanly
                 'error': '\n'.join(error_lines) if error_lines else '\n'.join(stderr_buf)[-3000:],
                 # Strip timestamps and deduplicate for a clean one-liner shown in the UI
-                'error_summary': _categorize_error(rc, stdout_buf, error_lines),
+                'error_summary': error_summary,
                 'return_code': rc,
                 'finished_at': datetime.utcnow().isoformat() + 'Z',
                 'card_csv': card_csv_str or verify_csv_str,  # For verify jobs, use verify CSV
@@ -939,7 +955,7 @@ def preflight():
 def explain_error():
     """Return a plain-English explanation for a raw ADO error.
 
-    Checks ado_error_kb.json first. If no KB match and OPENAI_API_KEY is set,
+    Checks ado_error_kb.json first. If no KB match and GPT_API_KEY is set,
     falls back to an LLM for unknown errors. Degrades gracefully if neither matches.
     """
     data = request.json or {}
@@ -970,8 +986,8 @@ def explain_error():
             action = action.format(type=type_name) if '{type}' in action else action
             return jsonify({'explanation': short, 'action': action, 'who': who, 'source': 'kb', 'code': code})
 
-    # LLM fallback — only if OPENAI_API_KEY is configured
-    openai_key = os.environ.get('OPENAI_API_KEY', '')
+    # LLM fallback — only if GPT_API_KEY is configured
+    openai_key = os.environ.get('GPT_API_KEY', '')
     if openai_key:
         try:
             import requests as req
@@ -983,13 +999,27 @@ def explain_error():
                 f"'{context.get('ado_project', '?')}'. Available ADO types: {context.get('available_types', [])}."
             )
             resp = req.post(
-                'https://api.openai.com/v1/chat/completions',
+                'https://crvdev-cus-dev-foundry.services.ai.azure.com/openai/v1/responses',
                 headers={'Authorization': f'Bearer {openai_key}', 'Content-Type': 'application/json'},
-                json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 150},
+                json={'model': 'gpt-4o-mini', 'input': prompt, 'max_output_tokens': 150},
                 timeout=10
             )
             resp.raise_for_status()
-            ai_text = resp.json()['choices'][0]['message']['content'].strip()
+            body = resp.json()
+            # Responses API: prefer the convenience field when present, else walk output[].content[]
+            ai_text = body.get('output_text', '').strip()
+            if not ai_text:
+                for item in body.get('output', []):
+                    if item.get('type') != 'message':
+                        continue
+                    for c in item.get('content', []):
+                        if c.get('type') == 'output_text' and c.get('text'):
+                            ai_text = c['text'].strip()
+                            break
+                    if ai_text:
+                        break
+            if not ai_text:
+                raise ValueError(f'No output_text in Responses API result: {body}')
             return jsonify({'explanation': ai_text, 'action': '', 'who': '', 'source': 'ai'})
         except Exception as exc:
             logging.warning(f'[explain-error] LLM call failed: {exc}')
@@ -1135,6 +1165,12 @@ def job_status(job_id):
         return jsonify({'error': 'Job not found'}), 404
     # Strip internal non-serializable fields before returning
     safe = {k: v for k, v in job.items() if not k.startswith('_')}
+    # Ensure required fields are always present with defaults
+    safe.setdefault('status', 'queued')
+    safe.setdefault('output', '')
+    safe.setdefault('error', '')
+    safe.setdefault('command', '')
+    safe.setdefault('progress', {'total': 0, 'done': 0, 'current_card': '', 'current_ado': '', 'current_action': ''})
     safe['has_csv'] = bool(safe.get('card_csv', ''))
     return jsonify(safe)
 

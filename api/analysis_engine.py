@@ -1,38 +1,22 @@
 """
 api/analysis_engine.py
-Phase 1: deterministic analysis — Jira + ADO API calls, no LLM required.
+Fetches Jira + ADO data and produces an AI-driven analysis report for the UI.
 
 Given a natural-language intent, Jira credentials, and an ADO project, this
 module samples Jira issues and compares them against the ADO project's work
-item type catalogue to produce a structured analysis report for the UI.
+item type/state catalogue. Type and state mapping suggestions are generated
+by GPT-mini (see _ai_map_types / _ai_map_states) — there is no static config
+file or hardcoded equivalents table; the UI lets a human override any
+suggestion afterwards.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import pathlib
 import re
 
 import requests
-
-_CONFIG_DIR = pathlib.Path(__file__).parent.parent / 'config'
-
-
-def _load_type_config() -> dict:
-    try:
-        with open(_CONFIG_DIR / 'type_config.json') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _load_state_config() -> dict:
-    try:
-        with open(_CONFIG_DIR / 'state_config.json') as f:
-            return json.load(f)
-    except Exception:
-        return {}
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +31,7 @@ SAMPLE_SIZE = 200
 
 def _intent_to_jql(intent: str) -> str | None:
     """
-    Best-effort natural-language → JQL for Phase 1.
-    Phase 3 will replace this with an LLM call.
+    Best-effort natural-language → JQL.
 
     Returns:
         JQL string, or None to signal "use filter API".
@@ -107,36 +90,51 @@ def _fetch_filter_jql(jira_url: str, email: str, token: str, filter_id: str) -> 
 
 def _fetch_issues(jira_url: str, email: str, token: str, jql: str) -> list[dict]:
     """
-    Fetch ALL issues matching the JQL, using pagination.
-    Jira API returns at most maxResults per request, so we loop until we get them all.
+    Fetch ALL issues matching the JQL using nextPageToken pagination.
+    Uses POST /rest/api/3/search/jql endpoint (supports unlimited results, no 1000-item cap).
     """
     url = f"{jira_url.rstrip('/')}/rest/api/3/search/jql"
     all_issues = []
-    start_at = 0
-    page_size = 100  # Jira default
+    page_token = None
+    
+    logger.info(f"[analysis] Fetching issues from {url} with JQL: {jql}")
     
     try:
         while True:
             body = {
                 "jql": jql,
-                "startAt": start_at,
-                "maxResults": page_size,
-                "fields": ["issuetype", "status", "assignee", "attachment", "comment", "priority"],
+                "maxResults": 200,
+                "fields": ["key", "issuetype", "status", "assignee", "attachment", "comment", "priority"],
             }
-            r = requests.post(url, auth=(email, token), json=body, timeout=15)
+            if page_token:
+                body["nextPageToken"] = page_token
+            
+            logger.debug(f"[analysis] _fetch_issues: Request body = {json.dumps(body, default=str)}")
+            
+            r = requests.post(
+                url,
+                auth=(email, token),
+                json=body,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=15
+            )
+            
+            # Log response details before raising for status
+            logger.debug(f"[analysis] _fetch_issues: Response status {r.status_code}")
+            if r.status_code >= 400:
+                logger.error(f"[analysis] _fetch_issues: Error response body = {r.text}")
+            
             r.raise_for_status()
             
             data = r.json()
             issues = data.get("issues", [])
             all_issues.extend(issues)
             
-            # Check if there are more results
-            total = data.get("total", 0)
-            if start_at + len(issues) >= total:
-                # We've fetched all available issues
+            # Check for next page
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                # No more pages
                 break
-            
-            start_at += page_size
         
         logger.info(f"[analysis] Fetched {len(all_issues)} total issues (pagination complete)")
         return all_issues
@@ -191,21 +189,26 @@ def _fetch_ado_states(ado_org: str, ado_project: str, ado_pat: str, work_item_ty
 
 def _fetch_ado_users(ado_org: str, ado_project: str, ado_pat: str) -> set[str]:
     """
-    Returns a set of lowercased ADO user email addresses from work items in the project.
+    Returns a set of lowercased ADO user email addresses.
     
-    Fetches work items with assignees to get actual users in the board.
-    This is more reliable than the Graph API which may have permission restrictions.
-    Falls back to Graph API if WIQL fails.
+    Prioritizes Graph API to get all organization members (not just assigned users).
+    Falls back to work items if Graph API is unavailable.
     """
-    # First, try to get users from actual work items in the project
+    # First, try Graph API to get ALL ADO members (most accurate for membership check)
+    ado_users = _fetch_ado_users_from_graph(ado_org, ado_pat)
+    if ado_users:
+        logger.info(f"[analysis] Found {len(ado_users)} unique users via ADO Graph API")
+        return ado_users
+    
+    # Fallback to work items if Graph API not available
+    logger.info("[analysis] Graph API returned no results, falling back to work items")
     ado_users = _fetch_ado_users_from_workitems(ado_org, ado_project, ado_pat)
     if ado_users:
         logger.info(f"[analysis] Found {len(ado_users)} unique users in ADO project work items")
         return ado_users
     
-    # Fallback to Graph API if WIQL fails
-    logger.warning("[analysis] Could not fetch users from work items, falling back to Graph API")
-    return _fetch_ado_users_from_graph(ado_org, ado_pat)
+    logger.warning("[analysis] Could not fetch ADO users via any method")
+    return set()
 
 
 def _fetch_ado_users_from_workitems(ado_org: str, ado_project: str, ado_pat: str) -> set[str]:
@@ -291,240 +294,243 @@ def _fetch_ado_users_from_graph(ado_org: str, ado_pat: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Gap computation
+# AI-driven type & state mapping — this is the ONLY mapping engine. There is
+# no hardcoded semantic-equivalents table and no static config-file mapping;
+# every Jira→ADO type/state suggestion comes from an LLM call, with the UI
+# left to let a human override any suggestion afterwards.
 # ---------------------------------------------------------------------------
 
-# Semantic equivalents used when Jira type name ≠ ADO type name exactly.
-_TYPE_EQUIVALENTS: dict[str, set[str]] = {
-    "story":    {"user story", "product backlog item", "requirement"},
-    "epic":     {"epic", "feature"},
-    "bug":      {"bug", "defect"},
-    "task":     {"task"},
-    "sub-task": {"task", "child task"},
-    "subtask":  {"task", "child task"},
-    "test":     {"test case", "test plan", "test suite"},
-}
+_AI_ENDPOINT = 'https://crvdev-cus-dev-foundry.services.ai.azure.com/openai/v1/responses'
+_AI_MODEL = 'gpt-5.4-mini'
 
 
-def _has_ado_match(jira_type: str, ado_types_lower: set[str], type_config: dict | None = None) -> bool:
-    if type_config:
-        mapped = type_config.get(jira_type) or type_config.get(jira_type.lower())
-        if mapped and mapped.lower() in ado_types_lower:
-            return True
-    jl = jira_type.lower()
-    if jl in ado_types_lower:
-        return True
-    for equiv in _TYPE_EQUIVALENTS.get(jl, set()):
-        if equiv in ado_types_lower:
-            return True
-    return False
+def _call_llm(prompt: str, max_output_tokens: int = 800) -> str | None:
+    """Call the GPT-mini Responses API. Returns the raw text output, or None
+    if GPT_API_KEY isn't configured or the call fails for any reason.
+    """
+    import os
+    api_key = os.environ.get('GPT_API_KEY', '')
+    if not api_key:
+        logger.warning('[ai-mapping] GPT_API_KEY not set — cannot use AI mapping')
+        return None
+    try:
+        resp = requests.post(
+            _AI_ENDPOINT,
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            json={'model': _AI_MODEL, 'input': prompt, 'max_output_tokens': max_output_tokens},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        text = body.get('output_text', '').strip()
+        if not text:
+            for item in body.get('output', []):
+                if item.get('type') != 'message':
+                    continue
+                for c in item.get('content', []):
+                    if c.get('type') == 'output_text' and c.get('text'):
+                        text = c['text'].strip()
+                        break
+                if text:
+                    break
+        return text or None
+    except Exception as exc:
+        logger.warning('[ai-mapping] LLM call failed: %s', exc)
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Type mapping engine  (replaces the hardcoded frontend buildMappings table)
-# ---------------------------------------------------------------------------
-
-# Curated semantic equivalents with ADO display names (title-cased).
-_SEMANTIC_EQUIVALENTS: dict[str, list[tuple[str, int, str]]] = {
-    # jira_key: [(ado_type_lower, confidence, reason), ...]  ordered by preference
-    "story":         [("user story", 96, "Industry-standard direct equivalent"),
-                      ("product backlog item", 92, "Scrum equivalent of a User Story"),
-                      ("requirement", 88, "Requirement maps to Story semantics")],
-    "user story":    [("user story", 99, "Exact name match"),
-                      ("product backlog item", 92, "Scrum equivalent")],
-    "epic":          [("epic", 99, "Exact name match"),
-                      ("feature", 88, "Feature is the closest ADO equivalent to Epic")],
-    "feature":       [("feature", 99, "Exact name match"),
-                      ("epic", 82, "Epic is the closest ADO equivalent to Feature")],
-    "bug":           [("bug", 99, "Exact name match"),
-                      ("defect", 97, "Exact semantic match — different display name")],
-    "defect":        [("bug", 97, "Bug is the standard ADO name for a defect"),
-                      ("defect", 99, "Exact name match")],
-    "task":          [("task", 99, "Exact name match")],
-    "sub-task":      [("task", 88, "Subtasks map to child Tasks in ADO"),
-                      ("child task", 90, "Direct equivalent")],
-    "subtask":       [("task", 88, "Subtasks map to child Tasks in ADO"),
-                      ("child task", 90, "Direct equivalent")],
-    "improvement":   [("user story", 79, "Improvements are user-facing enhancements — User Story is closest"),
-                      ("task", 74, "No direct ADO equivalent; Task is most general")],
-    "new feature":   [("feature", 90, "Direct semantic match"),
-                      ("user story", 82, "Feature request maps well to User Story")],
-    "technical debt":[("task", 72, "No direct ADO equivalent. Code-quality items map closest to Task"),
-                      ("user story", 60, "Could be framed as a quality improvement story")],
-    "test":          [("test case", 95, "Direct equivalent"),
-                      ("task", 70, "No test type in this project — Task is the fallback")],
-    "test case":     [("test case", 99, "Exact name match"),
-                      ("task", 70, "No test type — Task is the fallback")],
-    "spike":         [("task", 82, "Research spikes are typically tracked as Tasks in ADO"),
-                      ("user story", 70, "Can also be framed as a time-boxed User Story")],
-    "change request":[("user story", 80, "Change requests represent new scope — User Story is closest"),
-                      ("task", 74, "Task if it is a discrete implementation unit")],
-}
+def _extract_json(text: str):
+    """Pull the first JSON array/object out of a possibly markdown-fenced LLM reply."""
+    match = re.search(r'\[.*\]|\{.*\}', text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception as exc:
+        logger.warning('[ai-mapping] Could not parse JSON from LLM reply: %s', exc)
+        return None
 
 
-def _word_overlap_score(a: str, b: str) -> float:
-    """0.0–1.0 Jaccard similarity on word sets."""
-    wa = set(a.lower().split())
-    wb = set(b.lower().split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
+def _ai_map_types(by_type: list[dict], ado_types: list[str]) -> list[dict] | None:
+    """Ask GPT-mini to map every Jira issue type to the best available ADO work
+    item type. Returns None (caller falls back) if the AI call fails or
+    returns no usable mapping.
+    """
+    if not by_type or not ado_types:
+        return None
+    jira_list = '\n'.join(f'- "{t["name"]}" ({t["count"]} issues)' for t in by_type)
+    ado_list = ', '.join(f'"{t}"' for t in ado_types)
+    prompt = (
+        'You are an expert in migrating Jira issues to Azure DevOps (ADO) work items. '
+        'For each Jira issue type below, choose the single best-matching ADO work item type '
+        'from the AVAILABLE ADO TYPES list (you must pick one from that exact list — never invent a new name). '
+        'Respond with ONLY a JSON array, no prose, no markdown fences, shaped like:\n'
+        '[{"jira": "<jira type>", "ado": "<one of the available ADO types>", '
+        '"confidence": <integer 0-100>, "reason": "<one short sentence>"}, ...]\n\n'
+        f'JIRA ISSUE TYPES:\n{jira_list}\n\n'
+        f'AVAILABLE ADO TYPES: {ado_list}\n'
+    )
+    text = _call_llm(prompt)
+    if not text:
+        return None
+    parsed = _extract_json(text)
+    if not isinstance(parsed, list):
+        return None
 
-
-def _map_single_type(jira_type: str, count: int, ado_types: list[str], type_config: dict | None = None) -> dict:
-    """Return the best ADO mapping for one Jira issue type with confidence + reason."""
     ado_lower_to_display = {t.lower(): t for t in ado_types}
-    jira_key = jira_type.lower().strip()
+    counts = {t['name']: t['count'] for t in by_type}
+    results = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        jira_name = entry.get('jira')
+        if jira_name not in counts:
+            continue
+        ado_choice = str(entry.get('ado', '')).strip()
+        ado_display = ado_lower_to_display.get(ado_choice.lower())
+        if not ado_display:
+            # AI hallucinated a type not in the list — fall back to the first available
+            # ADO type for this entry rather than dropping it silently.
+            ado_display = ado_types[0]
+            confidence = 50
+            reason = f'AI suggested "{ado_choice}" which isn\'t in this project — defaulted to "{ado_display}".'
+        else:
+            confidence = int(entry.get('confidence', 60))
+            reason = str(entry.get('reason', 'AI-suggested mapping'))
+        results.append({
+            'jira': jira_name, 'count': counts[jira_name],
+            'ado': ado_display, 'confidence': max(0, min(confidence, 100)),
+            'reason': reason,
+        })
 
-    # 1. type_config.json — authoritative project-specific mapping
-    if type_config:
-        mapped = type_config.get(jira_type) or type_config.get(jira_key)
-        if mapped and mapped.lower() in ado_lower_to_display:
-            return {
-                "jira": jira_type, "count": count,
-                "ado": ado_lower_to_display[mapped.lower()],
-                "confidence": 100,
-                "reason": f"Configured mapping in type_config.json: {jira_type} → {mapped}",
-            }
-
-    # 2. Curated semantic table — fallback
-    for ado_lower, confidence, reason in _SEMANTIC_EQUIVALENTS.get(jira_key, []):
-        if ado_lower in ado_lower_to_display:
-            return {
-                "jira": jira_type, "count": count,
-                "ado": ado_lower_to_display[ado_lower],
-                "confidence": confidence, "reason": reason,
-            }
-
-    # 2. Exact case-insensitive match
-    if jira_key in ado_lower_to_display:
-        return {
-            "jira": jira_type, "count": count,
-            "ado": ado_lower_to_display[jira_key],
-            "confidence": 99, "reason": "Exact name match",
-        }
-
-    # 3. Substring containment
-    for ado_lower, ado_display in ado_lower_to_display.items():
-        if jira_key in ado_lower or ado_lower in jira_key:
-            score = 80 + round(10 * _word_overlap_score(jira_key, ado_lower))
-            return {
-                "jira": jira_type, "count": count,
-                "ado": ado_display,
-                "confidence": min(score, 89),
-                "reason": f'ADO type "{ado_display}" shares key words with "{jira_type}"',
-            }
-
-    # 4. Word-overlap fuzzy match
-    best_ado, best_score = max(
-        ((d, _word_overlap_score(jira_key, l)) for l, d in ado_lower_to_display.items()),
-        key=lambda x: x[1],
-    )
-    if best_score > 0.2:
-        confidence = 55 + round(25 * best_score)
-        return {
-            "jira": jira_type, "count": count,
-            "ado": best_ado,
-            "confidence": min(confidence, 79),
-            "reason": f'Partial name overlap with "{best_ado}" — review recommended',
-        }
-
-    # 5. Fallback to the most general available type
-    fallback = next(
-        (ado_lower_to_display[k] for k in ("task", "user story", "product backlog item") if k in ado_lower_to_display),
-        ado_types[0] if ado_types else "Task",
-    )
-    return {
-        "jira": jira_type, "count": count,
-        "ado": fallback,
-        "confidence": 55,
-        "reason": (
-            f'No direct ADO equivalent found for "{jira_type}". '
-            f'"{fallback}" is the most general available type — human review required.'
-        ),
-    }
+    # Make sure every Jira type got a mapping — fill in any the AI skipped.
+    mapped_names = {r['jira'] for r in results}
+    for t in by_type:
+        if t['name'] not in mapped_names:
+            results.append({
+                'jira': t['name'], 'count': t['count'],
+                'ado': ado_types[0], 'confidence': 50,
+                'reason': 'AI did not return a mapping for this type — defaulted to the first available ADO type.',
+            })
+    return results or None
 
 
 def build_type_mappings(by_type: list[dict], ado_types: list[str], type_config: dict | None = None) -> list[dict]:
-    """Generate type mappings, preferring type_config.json over hardcoded semantic table."""
-    return [_map_single_type(t["name"], t["count"], ado_types, type_config) for t in by_type]
+    """Generate type mappings using AI (GPT-mini). Falls back to an exact-name-match
+    (or first-available-type) safety net only when the AI call itself is unavailable.
+    """
+    ai_result = _ai_map_types(by_type, ado_types)
+    if ai_result is not None:
+        return ai_result
+
+    logger.warning('[ai-mapping] AI type mapping unavailable — using exact-match fallback only')
+    ado_lower_to_display = {t.lower(): t for t in ado_types}
+    fallback_type = ado_types[0] if ado_types else 'Task'
+    out = []
+    for t in by_type:
+        jira_key = t['name'].lower().strip()
+        if jira_key in ado_lower_to_display:
+            out.append({
+                'jira': t['name'], 'count': t['count'],
+                'ado': ado_lower_to_display[jira_key], 'confidence': 90,
+                'reason': 'Exact name match (AI mapping unavailable)',
+            })
+        else:
+            out.append({
+                'jira': t['name'], 'count': t['count'],
+                'ado': fallback_type, 'confidence': 40,
+                'reason': f'No AI mapping available and no exact match for "{t["name"]}" — human review required.',
+            })
+    return out
 
 
-# ---------------------------------------------------------------------------
-# State mapping engine (Jira status -> ADO state)
-# ---------------------------------------------------------------------------
+def _ai_map_states(by_status: list[dict], ado_states: list[str]) -> list[dict] | None:
+    """Ask GPT-mini to map every Jira status to the best available ADO state."""
+    if not by_status or not ado_states:
+        return None
+    jira_list = '\n'.join(f'- "{s["name"]}" ({s["count"]} issues)' for s in by_status)
+    ado_list = ', '.join(f'"{s}"' for s in ado_states)
+    prompt = (
+        'You are an expert in migrating Jira issues to Azure DevOps (ADO) work items. '
+        'For each Jira status below, choose the single best-matching ADO state '
+        'from the AVAILABLE ADO STATES list (you must pick one from that exact list — never invent a new name). '
+        'Respond with ONLY a JSON array, no prose, no markdown fences, shaped like:\n'
+        '[{"jira": "<jira status>", "ado": "<one of the available ADO states>", '
+        '"confidence": <integer 0-100>, "reason": "<one short sentence>"}, ...]\n\n'
+        f'JIRA STATUSES:\n{jira_list}\n\n'
+        f'AVAILABLE ADO STATES: {ado_list}\n'
+    )
+    text = _call_llm(prompt)
+    if not text:
+        return None
+    parsed = _extract_json(text)
+    if not isinstance(parsed, list):
+        return None
 
-# (ado state keyword, jira status keywords that suggest it) — checked in order
-_STATE_KEYWORD_TABLE: list[tuple[str, list[str]]] = [
-    ("new",       ["backlog", "to do", "todo", "draft", "idea", "ready", "prioritiz", "approved", "refinement", "selected"]),
-    ("active",    ["progress", "development", "doing", "review", "design"]),
-    ("resolved",  ["resolved", "qa", "acceptance", "verify"]),
-    ("closed",    ["done", "deploy", "complete", "closed"]),
-    ("completed", ["done", "deploy", "complete", "closed"]),
-    ("removed",   ["won't", "wont", "shelved", "declined", "cancel", "reject", "remove"]),
-]
-
-
-def _guess_ado_state(jira_state: str, ado_lower_to_display: dict[str, str]) -> tuple[str, int, str] | None:
-    """Best-effort keyword guess when no config/exact match exists."""
-    jl = jira_state.lower()
-    for target_kw, jira_kws in _STATE_KEYWORD_TABLE:
-        if any(kw in jl for kw in jira_kws):
-            for ado_lower, ado_display in ado_lower_to_display.items():
-                if target_kw in ado_lower:
-                    return ado_display, 78, f'Keyword match — "{jira_state}" typically maps to a "{target_kw}"-style state'
-    return None
-
-
-def _map_single_state(jira_state: str, count: int, ado_states: list[str], state_config: dict | None = None) -> dict:
-    """Return the best ADO state mapping for one Jira status with confidence + reason."""
     ado_lower_to_display = {s.lower(): s for s in ado_states}
+    counts = {s['name']: s['count'] for s in by_status}
+    results = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        jira_name = entry.get('jira')
+        if jira_name not in counts:
+            continue
+        ado_choice = str(entry.get('ado', '')).strip()
+        ado_display = ado_lower_to_display.get(ado_choice.lower())
+        if not ado_display:
+            ado_display = ado_states[0]
+            confidence = 50
+            reason = f'AI suggested "{ado_choice}" which isn\'t in this project — defaulted to "{ado_display}".'
+        else:
+            confidence = int(entry.get('confidence', 60))
+            reason = str(entry.get('reason', 'AI-suggested mapping'))
+        results.append({
+            'jira': jira_name, 'count': counts[jira_name],
+            'ado': ado_display, 'confidence': max(0, min(confidence, 100)),
+            'reason': reason,
+        })
 
-    # 1. state_config.json — authoritative project-specific mapping
-    if state_config:
-        mapped = state_config.get(jira_state) or state_config.get(jira_state.lower())
-        if mapped and mapped.lower() in ado_lower_to_display:
-            return {
-                "jira": jira_state, "count": count,
-                "ado": ado_lower_to_display[mapped.lower()],
-                "confidence": 100,
-                "reason": f"Configured mapping in state_config.json: {jira_state} → {mapped}",
-            }
-
-    # 2. Exact case-insensitive match
-    if jira_state.lower() in ado_lower_to_display:
-        return {
-            "jira": jira_state, "count": count,
-            "ado": ado_lower_to_display[jira_state.lower()],
-            "confidence": 97, "reason": "Exact name match",
-        }
-
-    # 3. Keyword-based semantic guess
-    guess = _guess_ado_state(jira_state, ado_lower_to_display)
-    if guess:
-        ado_display, confidence, reason = guess
-        return {"jira": jira_state, "count": count, "ado": ado_display, "confidence": confidence, "reason": reason}
-
-    # 4. Fallback — configured Default, else the most "New"-like state, else first available
-    default_mapped = state_config.get('Default') if state_config else None
-    if default_mapped and default_mapped.lower() in ado_lower_to_display:
-        fallback = ado_lower_to_display[default_mapped.lower()]
-    else:
-        fallback = next(
-            (ado_lower_to_display[k] for k in ("new", "to do", "proposed") if k in ado_lower_to_display),
-            ado_states[0] if ado_states else "New",
-        )
-    return {
-        "jira": jira_state, "count": count,
-        "ado": fallback,
-        "confidence": 55,
-        "reason": f'No direct ADO equivalent found for "{jira_state}". "{fallback}" used as fallback — review recommended.',
-    }
+    mapped_names = {r['jira'] for r in results}
+    for s in by_status:
+        if s['name'] not in mapped_names:
+            results.append({
+                'jira': s['name'], 'count': s['count'],
+                'ado': ado_states[0], 'confidence': 50,
+                'reason': 'AI did not return a mapping for this status — defaulted to the first available ADO state.',
+            })
+    return results or None
 
 
 def build_state_mappings(by_status: list[dict], ado_states: list[str], state_config: dict | None = None) -> list[dict]:
-    """Generate state mappings, preferring state_config.json over keyword heuristics."""
-    return [_map_single_state(s["name"], s["count"], ado_states, state_config) for s in by_status]
+    """Generate state mappings using AI (GPT-mini). Falls back to an exact-name-match
+    (or first-available-state) safety net only when the AI call itself is unavailable.
+    """
+    ai_result = _ai_map_states(by_status, ado_states)
+    if ai_result is not None:
+        return ai_result
+
+    logger.warning('[ai-mapping] AI state mapping unavailable — using exact-match fallback only')
+    ado_lower_to_display = {s.lower(): s for s in ado_states}
+    fallback_state = ado_states[0] if ado_states else 'New'
+    out = []
+    for s in by_status:
+        jira_key = s['name'].lower().strip()
+        if jira_key in ado_lower_to_display:
+            out.append({
+                'jira': s['name'], 'count': s['count'],
+                'ado': ado_lower_to_display[jira_key], 'confidence': 90,
+                'reason': 'Exact name match (AI mapping unavailable)',
+            })
+        else:
+            out.append({
+                'jira': s['name'], 'count': s['count'],
+                'ado': fallback_state, 'confidence': 40,
+                'reason': f'No AI mapping available and no exact match for "{s["name"]}" — human review required.',
+            })
+    return out
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -629,17 +635,6 @@ def run_analysis(
     ado_types = _fetch_ado_work_item_types(ado_org, ado_project, ado_pat)
     ado_users = _fetch_ado_users(ado_org, ado_project, ado_pat)
     ado_states = _fetch_ado_states(ado_org, ado_project, ado_pat, ado_types)
-    type_config = _load_type_config()
-    state_config = _load_state_config()
-
-    # 5. Compute gaps
-    ado_types_lower = {t.lower() for t in ado_types}
-
-    type_gaps = [
-        {"jira_type": t, "has_ado_match": False}
-        for t in type_counts
-        if not _has_ado_match(t, ado_types_lower, type_config)
-    ]
 
     # Only report user gaps when we successfully fetched ADO users
     if ado_users:
@@ -666,15 +661,28 @@ def run_analysis(
         for s, c in sorted(status_counts.items(), key=lambda x: -x[1])
     ]
 
+    # 5. Mapping — AI-driven (GPT-mini); no static config or hardcoded table.
+    type_mappings = build_type_mappings(by_type_list, ado_types)
+    state_mappings = build_state_mappings(by_status_list, ado_states)
+
+    # Gaps derive directly from the AI's own confidence rather than a separate
+    # static equivalents table — anything the AI wasn't confident about needs review.
+    _GAP_CONFIDENCE_THRESHOLD = 70
+    type_gaps = [
+        {"jira_type": m["jira"], "has_ado_match": False}
+        for m in type_mappings
+        if m["confidence"] < _GAP_CONFIDENCE_THRESHOLD
+    ]
+
     return {
         "total_issues": len(issues),
         "jql_used": jql,
         "by_type": by_type_list,
         "by_status": by_status_list,
         "ado_available_types": ado_types,
-        "type_mappings": build_type_mappings(by_type_list, ado_types, type_config),
+        "type_mappings": type_mappings,
         "ado_available_states": ado_states,
-        "state_mappings": build_state_mappings(by_status_list, ado_states, state_config),
+        "state_mappings": state_mappings,
         "type_gaps": type_gaps,
         "user_gaps": user_gaps,
         "attachment_count": attachment_total,
@@ -682,3 +690,4 @@ def run_analysis(
         "selected_statuses": status_filter or [],
         "selected_fields": field_filter or [],
     }
+
