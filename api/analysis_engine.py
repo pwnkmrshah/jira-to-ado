@@ -650,10 +650,12 @@ def _discover_related_items(jira_url: str, email: str, token: str, issue_keys: l
 
     def _process_batch(issues: list[dict]):
         """Populate related_items_map/related_keys from a batch of raw Jira issues
-        (parent + issuelinks discovery). Returns the set of newly-found child keys
-        to keep descending into on the next BFS level.
+        (parent hierarchy only). Issue links (relates-to, blocks, duplicates, etc.)
+        are recorded as metadata on the item but intentionally NOT added to
+        related_keys/related_items_map — they're just references, not part of the
+        parent/child chain that gets auto-migrated, and counting them pollutes the
+        type/status totals with unrelated cross-project issues.
         """
-        new_children = set()
         for issue in issues:
             key = issue.get("key", "")
             if not key:
@@ -681,10 +683,6 @@ def _discover_related_items(jira_url: str, email: str, token: str, issue_keys: l
                     linked_key = link["inwardIssue"].get("key")
                 if linked_key and linked_key not in issue_keys_set:
                     related_items_map[key]["linked_to"].append({"key": linked_key, "type": link_type})
-                    related_keys.add(linked_key)
-                    if linked_key not in related_items_map:
-                        _add_issue_entry(linked_key, "Unknown", "Unknown")
-        return new_children
 
     # Level 0: batch-fetch full details for the seed issues themselves.
     for batch in _chunked(issue_keys, _DISCOVERY_BATCH_SIZE):
@@ -725,11 +723,10 @@ def _discover_related_items(jira_url: str, email: str, token: str, issue_keys: l
                         linked_key = link["outwardIssue"].get("key")
                     elif "inwardIssue" in link:
                         linked_key = link["inwardIssue"].get("key")
+                    # Metadata only — not added to related_keys/related_items_map,
+                    # same reasoning as _process_batch above.
                     if linked_key and linked_key not in issue_keys_set and child_key in related_items_map:
                         related_items_map[child_key]["linked_to"].append({"key": linked_key, "type": link_type})
-                        related_keys.add(linked_key)
-                        if linked_key not in related_items_map:
-                            _add_issue_entry(linked_key, "Unknown", "Unknown")
 
                 if child_key not in visited:
                     visited.add(child_key)

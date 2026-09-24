@@ -196,29 +196,57 @@ _UNMAPPED_FIELDS_MARKER_END = '<!-- JIRA-CUSTOM-FIELDS-END -->'
 _UNRESOLVED_DYNAMIC_FIELDS: set = set()
 
 # The Jira 'Sprint' custom field id varies per Jira Cloud site — customfield_10007
-# on one site can be a completely different field on another. Resolved once per run
-# from field metadata (by name == 'Sprint') instead of ever being hardcoded.
-_SPRINT_FIELD_ID_CACHE: str | None = None
-_SPRINT_FIELD_ID_RESOLVED = False
+# on one site can be a completely different field on another. Different Jira
+# boards/projects can even have MULTIPLE fields literally named "Sprint" with
+# different ids, so all matches are resolved once per run (by name == 'Sprint')
+# and every ticket is checked against all of them, instead of assuming a single
+# global id or hardcoding one.
+_SPRINT_FIELD_IDS_CACHE: list[str] | None = None
 
 
-def _get_sprint_field_id(jira_client: JiraClient) -> str | None:
-    """Dynamically resolve this Jira instance's 'Sprint' custom field id."""
-    global _SPRINT_FIELD_ID_CACHE, _SPRINT_FIELD_ID_RESOLVED
-    if _SPRINT_FIELD_ID_RESOLVED:
-        return _SPRINT_FIELD_ID_CACHE
-    _SPRINT_FIELD_ID_RESOLVED = True
+def _get_sprint_field_ids(jira_client: JiraClient) -> list[str]:
+    """Dynamically resolve every Jira custom field id named 'Sprint' on this instance."""
+    global _SPRINT_FIELD_IDS_CACHE
+    if _SPRINT_FIELD_IDS_CACHE is not None:
+        return _SPRINT_FIELD_IDS_CACHE
+    ids = []
     try:
         for f in jira_client.get_field_metadata():
-            if (f.get('name') or '').strip().lower() == 'sprint':
-                _SPRINT_FIELD_ID_CACHE = f.get('id')
-                logging.info(f"[iteration-path] Resolved Jira 'Sprint' field id for this instance: {_SPRINT_FIELD_ID_CACHE}")
-                break
+            if (f.get('name') or '').strip().lower() == 'sprint' and f.get('id'):
+                ids.append(f['id'])
+        if ids:
+            logging.info(f"[iteration-path] Resolved Jira 'Sprint' field id(s) for this instance: {ids}")
         else:
-            logging.warning("[iteration-path] Could not find a Jira field named 'Sprint' on this instance")
+            logging.warning("[iteration-path] Could not find any Jira field named 'Sprint' on this instance")
     except Exception as e:
-        logging.warning(f"[iteration-path] Could not resolve Sprint field id: {e}")
-    return _SPRINT_FIELD_ID_CACHE
+        logging.warning(f"[iteration-path] Could not resolve Sprint field id(s): {e}")
+    _SPRINT_FIELD_IDS_CACHE = ids
+    return ids
+
+
+def _get_sprint_names(jira_ticket_fields: dict, jira_client: JiraClient, jira_key: str = "") -> list[str]:
+    """Return the sprint name(s) set on a ticket, checking every resolved Sprint
+    field id (a ticket only ever has a value under the one that applies to its
+    project/board — the others will simply be empty).
+    """
+    sprint_ids = _get_sprint_field_ids(jira_client)
+    if not sprint_ids:
+        logging.debug(f"[iteration-path] {jira_key}: No Sprint field IDs resolved for this instance")
+        return []
+    
+    for field_id in sprint_ids:
+        sprint_fields = jira_ticket_fields.get(field_id) or []
+        if sprint_fields:
+            logging.debug(f"[iteration-path] {jira_key}: Found Sprint field '{field_id}' = {sprint_fields}")
+        names = [s.get('name', '') for s in sprint_fields if isinstance(s, dict) and s.get('name')]
+        if names:
+            logging.debug(f"[iteration-path] {jira_key}: Extracted sprint names from '{field_id}': {names}")
+            return names
+        else:
+            logging.debug(f"[iteration-path] {jira_key}: No sprint value in field '{field_id}'")
+    
+    logging.debug(f"[iteration-path] {jira_key}: No sprint value found in any resolved field ID: {sprint_ids}")
+    return []
 
 
 def _get_jira_field_name_map(jira_client: JiraClient) -> dict:
@@ -282,11 +310,11 @@ def sync_dynamic_custom_fields(ado_id: int, jira_ticket: dict, ado_type: str,
     fields = jira_ticket.get('fields') or {}
     field_name_map = _get_jira_field_name_map(jira_client)
 
-    # customer_10007 is hardcoded historically, but the actual Sprint field id varies
-    # per Jira Cloud site — always exclude whatever id this instance resolves to, so
-    # Sprint never leaks into the generic description fallback (it's handled solely
-    # by the iteration-path logic above).
-    exclude_ids = _DYNAMIC_FIELD_EXCLUDE | {_get_sprint_field_id(jira_client)}
+    # customfield_10007 is hardcoded historically, but the actual Sprint field id(s)
+    # vary per Jira Cloud site (and can even differ per board) — always exclude every
+    # resolved id, so Sprint never leaks into the generic description fallback (it's
+    # handled solely by the iteration-path logic above).
+    exclude_ids = _DYNAMIC_FIELD_EXCLUDE | set(_get_sprint_field_ids(jira_client))
     candidates = [k for k in fields if k.startswith('customfield_') and k not in exclude_ids]
     candidates += [k for k in _DYNAMIC_TOP_LEVEL_FIELDS if k in fields]
 
@@ -908,13 +936,17 @@ def _build_description_with_metadata(base_description: str, reporter_line: str =
 
 def sync_links(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
                jira_id: str, jira_instance: str, ado_client: AzureDevOpsClient,
-               mapping: dict):
+               mapping: dict, skip_parent_linking: bool = False):
     """Add only new links to the ADO work item.
 
     For each linked Jira issue:
       - If the linked issue is already in ADO (via mapping or WIQL tag search),
         create a real ADO work item relationship (blocks, blocked-by, related, parent, child).
       - Otherwise fall back to adding the Jira URL as a hyperlink.
+
+    Args:
+        skip_parent_linking: If True, defer parent linking for later processing (when parent exists in ADO).
+                            Used during initial migration when parents may not be created yet.
 
     Deduplication: checks existing relation URLs before adding anything.
     """
@@ -963,12 +995,16 @@ def sync_links(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
 
     # ---- Parent relationship (from Jira parent field) ----
     # Use .get() to guard against the key being present but set to None
+    # SKIP if skip_parent_linking=True (deferred for end-of-migration pass)
     fields = jira_ticket.get('fields') or {}
-    parent_obj = fields.get('parent')
-    if parent_obj:
-        parent_key = parent_obj.get('key') if isinstance(parent_obj, dict) else None
-        if parent_key:
-            _add_real_or_fallback(parent_key, 'System.LinkTypes.Hierarchy-Reverse')
+    if not skip_parent_linking:
+        parent_obj = fields.get('parent')
+        if parent_obj:
+            parent_key = parent_obj.get('key') if isinstance(parent_obj, dict) else None
+            if parent_key:
+                _add_real_or_fallback(parent_key, 'System.LinkTypes.Hierarchy-Reverse')
+    else:
+        logging.debug(f"[sync_links] Deferring parent linking for {jira_id}")
 
     # ---- Inward / outward linked issues ----
     for a in (fields.get('issuelinks') or []):
@@ -994,6 +1030,63 @@ def sync_links(ado_id: int, jira_ticket: dict, jira_client: JiraClient,
 # ---------------------------------------------------------------------------
 # Centralized create-or-update orchestration
 # ---------------------------------------------------------------------------
+
+def process_deferred_parent_links(jira_tickets_by_key: dict, ado_client: AzureDevOpsClient,
+                                  jira_client: JiraClient, jira_instance: str, mapping: dict) -> int:
+    """After all work items are migrated, create parent-child relationships.
+    
+    This is called AFTER the initial migration pass so that when a child tries to link
+    to its parent, the parent is guaranteed to exist in ADO with correct ID from mapping.
+    
+    Returns the number of successful links created.
+    """
+    linked_count = 0
+    existing_urls = {}  # Cache to reduce API calls
+    
+    for jira_key, jira_ticket in jira_tickets_by_key.items():
+        if jira_ticket is None:
+            continue
+        
+        fields = jira_ticket.get('fields') or {}
+        parent_obj = fields.get('parent')
+        if not parent_obj:
+            continue
+        
+        parent_key = parent_obj.get('key') if isinstance(parent_obj, dict) else None
+        if not parent_key:
+            continue
+        
+        # Get child's ADO ID
+        child_ado_id = mapping.get(jira_key)
+        if not child_ado_id:
+            logging.debug(f"[deferred-links] {jira_key}: not in mapping (not migrated?)")
+            continue
+        
+        # Get parent's ADO ID
+        parent_ado_id = mapping.get(parent_key) or ado_client.find_work_item_by_jira_key(parent_key)
+        if not parent_ado_id:
+            logging.warning(f"[deferred-links] {jira_key}: parent '{parent_key}' not found in ADO")
+            continue
+        
+        # Check if link already exists
+        if child_ado_id not in existing_urls:
+            existing_urls[child_ado_id] = ado_client.get_work_item_relation_urls(child_ado_id)
+        
+        target_url = f'{ado_client.organization_url}/_apis/wit/workitems/{parent_ado_id}'
+        if target_url in existing_urls[child_ado_id]:
+            logging.debug(f"[deferred-links] Link already exists: {child_ado_id} → {parent_ado_id}")
+            continue
+        
+        # Create the parent-child link
+        try:
+            ado_client.add_work_item_link(child_ado_id, parent_ado_id, 'System.LinkTypes.Hierarchy-Reverse')
+            logging.info(f"[deferred-links] ✅ {jira_key} --[parent]--> {parent_key} ({child_ado_id} → {parent_ado_id})")
+            linked_count += 1
+        except Exception as e:
+            logging.warning(f"[deferred-links] Could not link {jira_key} to parent {parent_key}: {e}")
+    
+    return linked_count
+
 
 def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
                                 jira_client: JiraClient, jira_instance: str,
@@ -1129,28 +1222,25 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         # Try to use the Jira sprint name if available; fall back to team's default iteration
         _iter_path = _TEAM_ITERATION_PATH.get(_ap_team)
         
-        # Extract sprint name from Jira if available (field id resolved dynamically —
-        # it varies per Jira Cloud site, so it's never hardcoded).
+        # Extract sprint name from Jira if available (field id(s) resolved dynamically —
+        # they vary per Jira Cloud site/board, so never hardcoded).
         _jira_fields_iter = jira_ticket.get('fields') or {}
-        _sprint_field_id = _get_sprint_field_id(jira_client)
-        _sprint_fields = (_jira_fields_iter.get(_sprint_field_id) or []) if _sprint_field_id else []
-        _sprint_names = [s.get('name', '') for s in _sprint_fields if isinstance(s, dict) and s.get('name')]
+        _sprint_names = _get_sprint_names(_jira_fields_iter, jira_client, jira_key)
         
         # If sprint exists, try to use it as the iteration path
         if _sprint_names and _ap_team:
             _sprint_name = _sprint_names[0]  # Use the active/first sprint
             logging.info(f"[iteration-path] {jira_key}: Found Jira sprint: '{_sprint_name}'")
-            # Build iteration path: <project>\<team>\<sprint>
-            # Get the project name from the area path
-            if _iter_path and '\\' in _iter_path:
-                _project_and_team = _iter_path.rsplit('\\', 1)[0]
-                _proposed_iter = f"{_project_and_team}\\{_sprint_name}"
+            
+            # Create sprint iteration in ADO if it doesn't exist, then set it
+            _proposed_iter = ado_client.ensure_sprint_iteration_node(_sprint_name, _ap_team)
+            
+            if _proposed_iter:
                 logging.info(f"[iteration-path] {jira_key}: Attempting to set: {_proposed_iter}")
                 try:
                     ado_client.update_field(ado_id, '/fields/System.IterationPath', _proposed_iter)
                     logging.info(f"[iteration-path] ✅ {jira_key} → Iteration: '{_sprint_name}'")
                 except Exception as _e:
-                    # Sprint might not exist in ADO — fall back to team's default
                     logging.warning(f"[iteration-path] {jira_key}: Failed to set sprint '{_sprint_name}': {_e}")
                     logging.info(f"[iteration-path] {jira_key}: Falling back to team default: {_iter_path}")
                     if _iter_path:
@@ -1160,14 +1250,14 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
                         except Exception as _e2:
                             logging.warning(f"[iteration-path] {jira_key}: Could not set team default: {_e2}")
             else:
-                # Fall back to team iteration if we can't parse the path
-                logging.warning(f"[iteration-path] {jira_key}: Could not parse project/team from '{_iter_path}'")
+                # Sprint creation failed — fall back to team default
+                logging.warning(f"[iteration-path] {jira_key}: Could not create/ensure sprint '{_sprint_name}' in ADO")
                 if _iter_path:
                     try:
                         ado_client.update_field(ado_id, '/fields/System.IterationPath', _iter_path)
-                        logging.info(f"[iteration-path] ✅ {jira_key} → '{_iter_path}' (team default)")
+                        logging.info(f"[iteration-path] ✅ {jira_key} → Team default: '{_iter_path}'")
                     except Exception as _e:
-                        logging.warning(f"[iteration-path] {jira_key}: Could not set '{_iter_path}': {_e}")
+                        logging.warning(f"[iteration-path] {jira_key}: Could not set team default: {_e}")
         elif _iter_path:
             # No sprint in Jira — use team's default iteration
             logging.debug(f"[iteration-path] {jira_key}: No Jira sprint — using team default")
@@ -1415,7 +1505,7 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
 
     # ---- Hyperlinks / linked issues ----
     if _want('links'):
-        sync_links(ado_id, jira_ticket, jira_client, jira_id, jira_instance, ado_client, mapping)
+        sync_links(ado_id, jira_ticket, jira_client, jira_id, jira_instance, ado_client, mapping, skip_parent_linking=True)
 
     # ---- JiraKey tag — applied last so other updates cannot remove it ----
     ado_client.ensure_jira_key_tag(ado_id, jira_key)
@@ -1801,6 +1891,12 @@ def main():
                     save_failed_issue(jira_key, str(e))
                     failed_items.append(jira_key)
 
+            # PHASE 3: Process deferred parent-child links (now that all items exist in ADO)
+            logging.info("[main] PHASE 3: Processing deferred parent-child links...")
+            parent_links_created = process_deferred_parent_links(jira_tickets_by_key, ado_client, 
+                                                                 jira_client, jira_instance, mapping)
+            logging.info(f"[main] Created {parent_links_created} parent-child link(s)")
+
             print_run_summary(succeeded, failed_items, base_cmd, ado_client=ado_client)
             return
 
@@ -2048,6 +2144,12 @@ def main():
             else:
                 clear_failed_issue(jira_key)
                 succeeded.append(jira_key)
+
+        # PHASE 3: Process deferred parent-child links (now that all items exist in ADO)
+        logging.info("[main] PHASE 3: Processing deferred parent-child links...")
+        parent_links_created = process_deferred_parent_links(jira_tickets_by_key_filter, ado_client,
+                                                             jira_client, jira_instance, mapping)
+        logging.info(f"[main] Created {parent_links_created} parent-child link(s)")
 
         print_run_summary(succeeded, failed_items, base_cmd, ado_client=ado_client)
 

@@ -1003,6 +1003,99 @@ class AzureDevOpsClient:
         logging.info(f"[ensure_team_iteration_node] Team '{team_name}' iteration ready: '{iteration_path}'")
         return iteration_path
 
+    def ensure_sprint_iteration_node(self, sprint_name: str, team_name: str) -> str | None:
+        """Create a sprint iteration node under the project root (if missing) and add it to team's selected iterations.
+        
+        Args:
+            sprint_name: The name of the sprint (e.g., "CAR- Sprint 62")
+            team_name: The team this sprint belongs to
+            
+        Returns:
+            The full iteration path (e.g., "Carevive\\CAR- Sprint 62") or None on failure
+        """
+        import requests as _req, json as _json
+        auth = (self.username, self.access_token)
+        headers = {'Content-Type': 'application/json'}
+        
+        # Step 1: fetch the project root iteration to get its identifier
+        try:
+            tree_resp = _req.get(
+                f'{self.organization_url}/{self.project}'
+                f'/_apis/wit/classificationnodes/iterations?$depth=1&api-version=7.0',
+                auth=auth, headers=headers
+            )
+            if not tree_resp.ok:
+                logging.warning(f"[ensure_sprint_iteration_node] Could not fetch iteration tree for sprint '{sprint_name}'")
+                return None
+            
+            tree_data = tree_resp.json()
+            root_id = tree_data.get('identifier')
+            children = tree_data.get('children', [])
+            
+            # Check if sprint already exists
+            sprint_exists = any(c.get('name') == sprint_name for c in children)
+            if sprint_exists:
+                logging.debug(f"[ensure_sprint_iteration_node] Sprint '{sprint_name}' already exists in ADO")
+                return f'{self.project}\\{sprint_name}'
+            
+            # Step 2: create the sprint node under project root
+            create_data = {
+                'name': sprint_name,
+                'structureGroup': 'iteration'
+            }
+            create_resp = _req.post(
+                f'{self.organization_url}/{self.project}'
+                f'/_apis/wit/classificationnodes/iterations?api-version=7.0',
+                auth=auth, headers=headers,
+                data=_json.dumps(create_data)
+            )
+            
+            if not create_resp.ok:
+                logging.warning(
+                    f"[ensure_sprint_iteration_node] Could not create sprint '{sprint_name}': "
+                    f"{create_resp.status_code} {create_resp.text[:200]}"
+                )
+                return None
+            
+            logging.info(f"[ensure_sprint_iteration_node] ✅ Created sprint iteration '{sprint_name}' in ADO")
+            
+            # Step 3: add sprint to team's selected iterations (optional but recommended)
+            try:
+                sprint_path = f'{self.project}\\{sprint_name}'
+                settings_resp = _req.get(
+                    f'{self.organization_url}/{self.project}/{team_name}'
+                    f'/_apis/work/teamsettings/iterations?api-version=7.0',
+                    auth=auth, headers=headers
+                )
+                if settings_resp.ok:
+                    # Check if already added
+                    iterations = settings_resp.json().get('value', [])
+                    if not any(it.get('path') == sprint_path for it in iterations):
+                        # Add to selected iterations
+                        sprint_node = {
+                            'id': create_resp.json().get('identifier'),
+                            'name': sprint_name,
+                            'path': sprint_path
+                        }
+                        add_resp = _req.post(
+                            f'{self.organization_url}/{self.project}/{team_name}'
+                            f'/_apis/work/teamsettings/iterations?api-version=7.0',
+                            auth=auth, headers=headers,
+                            data=_json.dumps(sprint_node)
+                        )
+                        if add_resp.ok:
+                            logging.info(f"[ensure_sprint_iteration_node] ✅ Added '{sprint_name}' to team '{team_name}' selected iterations")
+                        else:
+                            logging.warning(f"[ensure_sprint_iteration_node] Could not add sprint to team iterations: {add_resp.status_code}")
+            except Exception as e:
+                logging.warning(f"[ensure_sprint_iteration_node] Could not add sprint to team iterations: {e}")
+            
+            return f'{self.project}\\{sprint_name}'
+            
+        except Exception as e:
+            logging.warning(f"[ensure_sprint_iteration_node] Error creating sprint '{sprint_name}': {e}")
+            return None
+
     def configure_team_iteration(self, team_name: str) -> bool:
         """Set the backlog iteration for *team_name* to the project root iteration.
 
