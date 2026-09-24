@@ -17,8 +17,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# lib/ would ignore src/lib files, so use more specific patterns
 lib64/
+!web-ui/src/lib/
 parts/
 sdist/
 var/
