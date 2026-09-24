@@ -275,22 +275,37 @@ def _fetch_ado_users_from_graph(ado_org: str, ado_pat: str) -> set[str]:
     """
     Fallback to fetch ADO users via Graph API.
     Returns a set of lowercased ADO member email addresses.
+
+    Paginates using the X-MS-ContinuationToken response header — without this,
+    orgs with more users than fit on one page silently lose members past the
+    first page (e.g. a real admin reported as a "gap" simply because their
+    page never got fetched).
     """
-    url = f"https://vssps.dev.azure.com/{ado_org}/_apis/graph/users?api-version=7.1-preview.1"
+    base_url = f"https://vssps.dev.azure.com/{ado_org}/_apis/graph/users?api-version=7.1-preview.1"
+    emails: set[str] = set()
+    continuation_token = None
     try:
-        r = requests.get(url, auth=("", ado_pat), timeout=30)
-        if r.status_code in (403, 401):
-            logger.info("[analysis] ADO Graph API not in PAT scope — cannot verify user availability")
-            return set()
-        r.raise_for_status()
-        return {
-            u.get("mailAddress", "").lower()
-            for u in r.json().get("value", [])
-            if u.get("mailAddress")
-        }
+        while True:
+            url = base_url
+            if continuation_token:
+                url = f"{base_url}&continuationToken={continuation_token}"
+            r = requests.get(url, auth=("", ado_pat), timeout=30)
+            if r.status_code in (403, 401):
+                logger.info("[analysis] ADO Graph API not in PAT scope — cannot verify user availability")
+                return set()
+            r.raise_for_status()
+            body = r.json()
+            for u in body.get("value", []):
+                mail = (u.get("mailAddress") or u.get("principalName") or "").lower()
+                if mail:
+                    emails.add(mail)
+            continuation_token = r.headers.get("X-MS-ContinuationToken")
+            if not continuation_token:
+                break
+        return emails
     except Exception as exc:
         logger.warning("[analysis] ADO Graph API fetch failed: %s", exc)
-        return set()
+        return emails
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +546,242 @@ def build_state_mappings(by_status: list[dict], ado_states: list[str], state_con
     return out
 
 
+# ---------------------------------------------------------------------------
+# Related Items Discovery
+# ---------------------------------------------------------------------------
+
+# Max keys per batched JQL "in (...)" clause — keeps query length/response size
+# reasonable while still turning what used to be N individual requests into
+# ceil(N / batch_size) requests.
+_DISCOVERY_BATCH_SIZE = 50
+
+
+def _fetch_issues_for_discovery(jira_url: str, email: str, token: str, jql: str) -> list[dict]:
+    """Batched issue fetch used only for related-item discovery — requests just
+    the fields needed to find parent/child/linked relationships (key, type,
+    status, parent, issuelinks), and paginates via nextPageToken.
+    """
+    url = f"{jira_url.rstrip('/')}/rest/api/3/search/jql"
+    all_issues: list[dict] = []
+    page_token = None
+    try:
+        while True:
+            body = {
+                "jql": jql,
+                "maxResults": 200,
+                "fields": ["key", "issuetype", "status", "parent", "issuelinks"],
+            }
+            if page_token:
+                body["nextPageToken"] = page_token
+            r = requests.post(
+                url, auth=(email, token), json=body,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            all_issues.extend(data.get("issues", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return all_issues
+    except Exception as exc:
+        logger.warning(f"[analysis] Discovery batch fetch failed for JQL '{jql}': {exc}")
+        return []
+
+
+def _chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _discover_related_items(jira_url: str, email: str, token: str, issue_keys: list[str]) -> dict:
+    """
+    Discover all related items (children, subtasks, linked issues) for a set of issues.
+
+    Status mapping is intentionally NOT resolved here — the caller merges the
+    raw types/statuses discovered into the overall type/state mapping tables
+    first (so children get their own editable ADO mapping row), then attaches
+    status_mapped afterwards.
+
+    Uses BATCHED JQL queries (key in (...), parent in (...)) instead of one
+    request per issue — for a 200+ issue filter, one-request-per-issue used to
+    take minutes and trip the API's request timeout; batching brings this down
+    to a handful of requests total.
+
+    Args:
+        jira_url: Jira base URL
+        email: Jira email
+        token: Jira token
+        issue_keys: List of main issue keys to discover relationships for
+    
+    Returns dict with:
+        - related_items_discovered: count of unique related items found
+        - related_items_by_type: list of type counts
+        - related_items_details: list of issue details with relationships (status_mapped filled in later)
+        - related_items_keys: set of all related issue keys (for dedupe)
+    """
+    # Normalize all issue keys to UPPERCASE
+    issue_keys = [k.upper().strip() for k in issue_keys if k and k.strip()]
+    issue_keys_set = set(issue_keys)
+    
+    if not issue_keys:
+        return {
+            "related_items_discovered": 0,
+            "related_items_by_type": [],
+            "related_items_details": [],
+            "related_items_keys": set(),
+        }
+    
+    related_items_map = {}  # key → {key, type, status, status_mapped, children, linked_to}
+    related_keys = set()
+
+    def _add_issue_entry(key: str, issue_type: str, status: str, parent: str | None = None):
+        if key not in related_items_map:
+            related_items_map[key] = {
+                "key": key,
+                "type": issue_type,
+                "status": status,
+                "status_mapped": status,
+                "children": [],
+                "linked_to": [],
+                "parent": parent,
+            }
+
+    def _process_batch(issues: list[dict]):
+        """Populate related_items_map/related_keys from a batch of raw Jira issues
+        (parent + issuelinks discovery). Returns the set of newly-found child keys
+        to keep descending into on the next BFS level.
+        """
+        new_children = set()
+        for issue in issues:
+            key = issue.get("key", "")
+            if not key:
+                continue
+            fields = issue.get("fields", {}) or {}
+            issue_type = (fields.get("issuetype") or {}).get("name", "Unknown")
+            status = (fields.get("status") or {}).get("name", "Unknown")
+            _add_issue_entry(key, issue_type, status)
+
+            parent = fields.get("parent")
+            if parent:
+                parent_key = parent.get("key", "")
+                if parent_key and parent_key not in issue_keys_set:
+                    related_items_map[key]["parent"] = parent_key
+                    related_keys.add(parent_key)
+                    if parent_key not in related_items_map:
+                        _add_issue_entry(parent_key, "Unknown", "Unknown")
+
+            for link in fields.get("issuelinks", []) or []:
+                linked_key = None
+                link_type = (link.get("type") or {}).get("name", "unknown")
+                if "outwardIssue" in link:
+                    linked_key = link["outwardIssue"].get("key")
+                elif "inwardIssue" in link:
+                    linked_key = link["inwardIssue"].get("key")
+                if linked_key and linked_key not in issue_keys_set:
+                    related_items_map[key]["linked_to"].append({"key": linked_key, "type": link_type})
+                    related_keys.add(linked_key)
+                    if linked_key not in related_items_map:
+                        _add_issue_entry(linked_key, "Unknown", "Unknown")
+        return new_children
+
+    # Level 0: batch-fetch full details for the seed issues themselves.
+    for batch in _chunked(issue_keys, _DISCOVERY_BATCH_SIZE):
+        quoted = ', '.join(f'"{k}"' for k in batch)
+        issues = _fetch_issues_for_discovery(jira_url, email, token, f'key in ({quoted})')
+        _process_batch(issues)
+
+    # BFS across the full parent→child chain (Epic → Story → Task → ...), one
+    # batched "parent in (...)" query per level instead of one query per issue.
+    visited = set(issue_keys)
+    frontier = set(issue_keys)
+    while frontier:
+        next_frontier = set()
+        frontier_list = sorted(frontier)
+        for batch in _chunked(frontier_list, _DISCOVERY_BATCH_SIZE):
+            quoted = ', '.join(f'"{k}"' for k in batch)
+            child_issues = _fetch_issues_for_discovery(jira_url, email, token, f'parent in ({quoted})')
+            for child in child_issues:
+                child_key = child.get("key", "")
+                if not child_key:
+                    continue
+                fields = child.get("fields", {}) or {}
+                parent_key = (fields.get("parent") or {}).get("key", "")
+                child_type = (fields.get("issuetype") or {}).get("name", "Unknown")
+                child_status = (fields.get("status") or {}).get("name", "Unknown")
+
+                if child_key not in issue_keys_set:
+                    _add_issue_entry(child_key, child_type, child_status, parent=parent_key or None)
+                    related_keys.add(child_key)
+                    if parent_key and parent_key in related_items_map:
+                        if child_key not in related_items_map[parent_key]["children"]:
+                            related_items_map[parent_key]["children"].append(child_key)
+
+                for link in fields.get("issuelinks", []) or []:
+                    linked_key = None
+                    link_type = (link.get("type") or {}).get("name", "unknown")
+                    if "outwardIssue" in link:
+                        linked_key = link["outwardIssue"].get("key")
+                    elif "inwardIssue" in link:
+                        linked_key = link["inwardIssue"].get("key")
+                    if linked_key and linked_key not in issue_keys_set and child_key in related_items_map:
+                        related_items_map[child_key]["linked_to"].append({"key": linked_key, "type": link_type})
+                        related_keys.add(linked_key)
+                        if linked_key not in related_items_map:
+                            _add_issue_entry(linked_key, "Unknown", "Unknown")
+
+                if child_key not in visited:
+                    visited.add(child_key)
+                    next_frontier.add(child_key)
+        frontier = next_frontier
+
+    # Batch-fetch details for any related items still missing type/status
+    # (e.g. parents/linked issues discovered but never fetched directly).
+    unknown_keys = [k for k, v in related_items_map.items() if v["type"] == "Unknown"]
+    for batch in _chunked(unknown_keys, _DISCOVERY_BATCH_SIZE):
+        quoted = ', '.join(f'"{k}"' for k in batch)
+        issues = _fetch_issues_for_discovery(jira_url, email, token, f'key in ({quoted})')
+        for issue in issues:
+            key = issue.get("key", "")
+            if not key or key not in related_items_map:
+                continue
+            fields = issue.get("fields", {}) or {}
+            related_items_map[key]["type"] = (fields.get("issuetype") or {}).get("name", "Unknown")
+            related_items_map[key]["status"] = (fields.get("status") or {}).get("name", "Unknown")
+            related_items_map[key]["status_mapped"] = related_items_map[key]["status"]
+
+    # Count by type and by status — returned so the caller can merge these
+    # into the overall type/state mapping tables (children need their own
+    # editable ADO mapping row too, not just a hardcoded status_mapped value).
+    # IMPORTANT: related_items_map also contains the original seed issues
+    # themselves (visited during the BFS) — exclude those here, since they're
+    # already counted once in the primary by_type/by_status totals. Counting
+    # them again here would double-count (e.g. an Epic showing count=2
+    # instead of 1).
+    type_counts = {}
+    status_counts = {}
+    for key, item in related_items_map.items():
+        if key in issue_keys_set:
+            continue
+        type_counts[item["type"]] = type_counts.get(item["type"], 0) + 1
+        status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+    
+    by_type_list = [
+        {"type": t, "count": c}
+        for t, c in sorted(type_counts.items(), key=lambda x: -x[1])
+    ]
+    
+    logger.info(f"[analysis] Discovered {len(related_keys)} related items across {len(type_counts)} types")
+    
+    return {
+        "related_items_discovered": len(related_keys),
+        "related_items_by_type": by_type_list,
+        "related_items_details": list(related_items_map.values()),
+        "related_items_keys": related_keys,
+        "related_type_counts": type_counts,
+        "related_status_counts": status_counts,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +817,10 @@ def run_analysis(
     if jira_keys is None:
         jira_keys = []
     
+    # Normalize all Jira keys to UPPERCASE (Jira API is case-sensitive)
+    jira_project_key = jira_project_key.upper().strip() if jira_project_key else ''
+    jira_keys = [k.upper().strip() for k in jira_keys if k and k.strip()]
+    
     # Determine JQL based on scope
     if jira_filter_id:
         # Use Jira filter: Let Jira resolve the filter ID server-side
@@ -574,7 +829,7 @@ def run_analysis(
         scope_desc = f"filter {jira_filter_id}"
         logger.info(f"[analysis] Using Jira filter {jira_filter_id}")
     elif jira_keys:
-        # Use specific keys
+        # Use specific keys (normalized to uppercase)
         quoted_keys = ', '.join(f'"{k}"' for k in jira_keys)
         jql = f'key in ({quoted_keys})'
         scope_desc = f"keys {jira_keys}"
@@ -638,7 +893,7 @@ def run_analysis(
 
     # Only report user gaps when we successfully fetched ADO users
     if ado_users:
-        logger.info(f"[analysis] ADO users found: {len(ado_users)} unique emails: {ado_users}")
+        logger.info(f"[analysis] ADO users found: {len(ado_users)} unique members")
         user_gaps = [
             {"jira_user": email, "found_in_ado": False}
             for email in sorted(jira_emails)
@@ -661,9 +916,34 @@ def run_analysis(
         for s, c in sorted(status_counts.items(), key=lambda x: -x[1])
     ]
 
-    # 5. Mapping — AI-driven (GPT-mini); no static config or hardcoded table.
-    type_mappings = build_type_mappings(by_type_list, ado_types)
-    state_mappings = build_state_mappings(by_status_list, ado_states)
+    # 5. Discover related items (children, subtasks, linked issues) BEFORE
+    # building mappings, so their types/statuses (e.g. a child "Story" under
+    # a migrated "Epic") get their own editable ADO mapping row too, instead
+    # of only appearing as read-only text in the related-items list.
+    issue_keys = [issue.get("key", "") for issue in issues if issue.get("key")]
+    related_discovery = _discover_related_items(jira_url, jira_email, jira_token, issue_keys)
+    logger.info(f"[analysis] Related items discovery: {related_discovery['related_items_discovered']} items found")
+
+    merged_type_counts = dict(type_counts)
+    for t, c in related_discovery.get("related_type_counts", {}).items():
+        merged_type_counts[t] = merged_type_counts.get(t, 0) + c
+    merged_status_counts = dict(status_counts)
+    for s, c in related_discovery.get("related_status_counts", {}).items():
+        merged_status_counts[s] = merged_status_counts.get(s, 0) + c
+
+    merged_by_type_list = [
+        {"name": t, "count": c}
+        for t, c in sorted(merged_type_counts.items(), key=lambda x: -x[1])
+    ]
+    merged_by_status_list = [
+        {"name": s, "count": c}
+        for s, c in sorted(merged_status_counts.items(), key=lambda x: -x[1])
+    ]
+
+    # 6. Mapping — AI-driven (GPT-mini); no static config or hardcoded table.
+    # Built from the MERGED counts so related/child items are covered too.
+    type_mappings = build_type_mappings(merged_by_type_list, ado_types)
+    state_mappings = build_state_mappings(merged_by_status_list, ado_states)
 
     # Gaps derive directly from the AI's own confidence rather than a separate
     # static equivalents table — anything the AI wasn't confident about needs review.
@@ -673,6 +953,12 @@ def run_analysis(
         for m in type_mappings
         if m["confidence"] < _GAP_CONFIDENCE_THRESHOLD
     ]
+
+    # Now that the final state mappings exist, resolve each related item's
+    # status_mapped (it was left as a passthrough placeholder during discovery).
+    state_lookup = {m["jira"].lower(): m["ado"] for m in state_mappings}
+    for item in related_discovery.get("related_items_details", []):
+        item["status_mapped"] = state_lookup.get(item["status"].lower(), item["status"])
 
     return {
         "total_issues": len(issues),
@@ -689,5 +975,9 @@ def run_analysis(
         "comment_count": comment_total,
         "selected_statuses": status_filter or [],
         "selected_fields": field_filter or [],
+        # NEW: Related items information
+        "related_items_discovered": related_discovery["related_items_discovered"],
+        "related_items_by_type": related_discovery["related_items_by_type"],
+        "related_items_details": related_discovery["related_items_details"],
     }
 

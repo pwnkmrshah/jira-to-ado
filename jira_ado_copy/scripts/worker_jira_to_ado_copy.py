@@ -163,17 +163,16 @@ _TEAM_ITERATION_PATH: dict = {}
 _JIRA_FIELD_NAME_CACHE: dict = {}
 
 # Jira fields that already have dedicated handling elsewhere in create_or_update_work_item
-# (Sprint -> tags, Customers -> description) and should NOT also go through the generic
-# dynamic custom-field mapper below.
+# (Sprint -> iteration path, Customers -> description, Labels/Fix Version/Affects
+# Version/Release -> tags) and should NOT also go through the generic dynamic
+# custom-field mapper below.
 _DYNAMIC_FIELD_EXCLUDE = {'customfield_10007', 'customfield_10907'}
 
 # Well-known top-level (non customfield_*) Jira fields worth mapping dynamically too.
-_DYNAMIC_TOP_LEVEL_FIELDS = {
-    'fixVersions': 'Fix Version/s',
-    'versions': 'Affects Versions',
-    'release': 'Release',
-    'labels': 'Labels',
-}
+# NOTE: fixVersions/versions/release/labels are handled directly as ADO tags (see the
+# tags-merge block in create_or_update_work_item) — they are intentionally NOT listed
+# here so they never fall through to the description-block fallback.
+_DYNAMIC_TOP_LEVEL_FIELDS = {}
 
 # ADO fields this worker already populates via dedicated, purpose-built logic elsewhere
 # in create_or_update_work_item(). The generic dynamic-field matcher must never reuse
@@ -195,6 +194,31 @@ _UNMAPPED_FIELDS_MARKER_END = '<!-- JIRA-CUSTOM-FIELDS-END -->'
 # Cross-ticket tally of Jira field display names that never got a real ADO field this
 # run (no match, and creation failed/blocked) — reported once in the final run summary.
 _UNRESOLVED_DYNAMIC_FIELDS: set = set()
+
+# The Jira 'Sprint' custom field id varies per Jira Cloud site — customfield_10007
+# on one site can be a completely different field on another. Resolved once per run
+# from field metadata (by name == 'Sprint') instead of ever being hardcoded.
+_SPRINT_FIELD_ID_CACHE: str | None = None
+_SPRINT_FIELD_ID_RESOLVED = False
+
+
+def _get_sprint_field_id(jira_client: JiraClient) -> str | None:
+    """Dynamically resolve this Jira instance's 'Sprint' custom field id."""
+    global _SPRINT_FIELD_ID_CACHE, _SPRINT_FIELD_ID_RESOLVED
+    if _SPRINT_FIELD_ID_RESOLVED:
+        return _SPRINT_FIELD_ID_CACHE
+    _SPRINT_FIELD_ID_RESOLVED = True
+    try:
+        for f in jira_client.get_field_metadata():
+            if (f.get('name') or '').strip().lower() == 'sprint':
+                _SPRINT_FIELD_ID_CACHE = f.get('id')
+                logging.info(f"[iteration-path] Resolved Jira 'Sprint' field id for this instance: {_SPRINT_FIELD_ID_CACHE}")
+                break
+        else:
+            logging.warning("[iteration-path] Could not find a Jira field named 'Sprint' on this instance")
+    except Exception as e:
+        logging.warning(f"[iteration-path] Could not resolve Sprint field id: {e}")
+    return _SPRINT_FIELD_ID_CACHE
 
 
 def _get_jira_field_name_map(jira_client: JiraClient) -> dict:
@@ -258,7 +282,12 @@ def sync_dynamic_custom_fields(ado_id: int, jira_ticket: dict, ado_type: str,
     fields = jira_ticket.get('fields') or {}
     field_name_map = _get_jira_field_name_map(jira_client)
 
-    candidates = [k for k in fields if k.startswith('customfield_') and k not in _DYNAMIC_FIELD_EXCLUDE]
+    # customer_10007 is hardcoded historically, but the actual Sprint field id varies
+    # per Jira Cloud site — always exclude whatever id this instance resolves to, so
+    # Sprint never leaks into the generic description fallback (it's handled solely
+    # by the iteration-path logic above).
+    exclude_ids = _DYNAMIC_FIELD_EXCLUDE | {_get_sprint_field_id(jira_client)}
+    candidates = [k for k in fields if k.startswith('customfield_') and k not in exclude_ids]
     candidates += [k for k in _DYNAMIC_TOP_LEVEL_FIELDS if k in fields]
 
     # Debug logging: show what was discovered
@@ -572,12 +601,11 @@ def build_parsed_fields(jira_ticket: dict, type_config: dict, state_config: dict
     jira_key = jira_ticket.get('key', 'UNKNOWN')
     fields = jira_ticket.get('fields') or {}
 
-    parent_key = (fields.get('parent') or {}).get('key')
     summary = fields.get('summary', 'No Summary')
-    if parent_key:
-        title = f'[{parent_key}] [{jira_key}] {summary}'
-    else:
-        title = f'[{jira_key}] {summary}'
+    # Parent/child relationship is captured via a real ADO Parent/Child link
+    # (see sync_links), so the title only needs this item's own key — no need
+    # to duplicate the parent's key in the title text.
+    title = f'[{jira_key}] {summary}'
 
     # ADO rejects titles over 255 chars; truncate and keep full text for description.
     _ADO_TITLE_MAX = 255
@@ -1101,9 +1129,11 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
         # Try to use the Jira sprint name if available; fall back to team's default iteration
         _iter_path = _TEAM_ITERATION_PATH.get(_ap_team)
         
-        # Extract sprint name from Jira if available
+        # Extract sprint name from Jira if available (field id resolved dynamically —
+        # it varies per Jira Cloud site, so it's never hardcoded).
         _jira_fields_iter = jira_ticket.get('fields') or {}
-        _sprint_fields = _jira_fields_iter.get('customfield_10007') or []
+        _sprint_field_id = _get_sprint_field_id(jira_client)
+        _sprint_fields = (_jira_fields_iter.get(_sprint_field_id) or []) if _sprint_field_id else []
         _sprint_names = [s.get('name', '') for s in _sprint_fields if isinstance(s, dict) and s.get('name')]
         
         # If sprint exists, try to use it as the iteration path
@@ -1316,15 +1346,24 @@ def create_or_update_work_item(jira_ticket: dict, ado_client: AzureDevOpsClient,
             # Defensive: do not fail the whole worker if date logic fails
             logging.warning(f"[dates] Unexpected error handling resolution date for {jira_key}: {e}")
 
-    # ---- Labels / tags (merge, do not overwrite existing tags) ----
+    # ---- Labels / Fix Version / Affects Version / Release -> tags (merge, do not overwrite existing tags) ----
+    # NOTE: Sprint is intentionally NOT included here — it's mapped to System.IterationPath
+    # above, so duplicating it into tags as well would just be redundant/confusing.
     jira_fields = jira_ticket.get('fields') or {}  # re-bind in case dates block was skipped
     _want_labels = _want('labels')
-    _want_sprint = _want('sprint')
-    if _want_labels or _want_sprint:
+    _want_versions = _want('versions')
+    if _want_labels or _want_versions:
         labels = jira_fields.get('labels', []) if _want_labels else []
-        sprint_fields = jira_fields.get('customfield_10007') or [] if _want_sprint else []
-        sprint_names = [s.get('name', '') for s in sprint_fields if isinstance(s, dict) and s.get('name')]
-        all_new_tags = labels + sprint_names
+        version_tags = []
+        if _want_versions:
+            fix_versions = jira_fields.get('fixVersions') or []
+            affects_versions = jira_fields.get('versions') or []
+            version_tags += [f"FixVersion:{v.get('name')}" for v in fix_versions if isinstance(v, dict) and v.get('name')]
+            version_tags += [f"AffectsVersion:{v.get('name')}" for v in affects_versions if isinstance(v, dict) and v.get('name')]
+            release_value = jira_fields.get('release')
+            if isinstance(release_value, str) and release_value.strip():
+                version_tags.append(f"Release:{release_value.strip()}")
+        all_new_tags = labels + version_tags
         if all_new_tags:
             item = ado_client.get_work_item_full(ado_id)
             existing_tags = (item.get('fields', {}).get('System.Tags') or '').strip() if item else ''
@@ -1575,39 +1614,52 @@ def main():
             logging.info(f"[main] Direct mode: fetching {len(target_keys)} issues by key: {target_keys}")
 
             # PHASE 1: Sort issues by dependency (parents before subtasks)
-            print(f'[bootstrap] Sorting {len(target_keys)} issues by parent dependencies...')
+            # Keep track of original parent count for progress reporting
+            parent_count = len(target_keys)
+            print(f'[bootstrap] Sorting {parent_count} parent issue(s) by dependencies...')
             jira_tickets_by_key = {}
             for jira_key in target_keys:
                 jira_ticket = jira_client.get_jira_issue(jira_key)
                 if jira_ticket:
                     jira_tickets_by_key[jira_key] = jira_ticket
             
-            # Ensure parents are processed before subtasks
+            # Ensure children are processed BEFORE their parents (post-order), so ADO
+            # parent/child links are set up cleanly without orphaned children.
+            children_map_initial = {}
+            for k, t in jira_tickets_by_key.items():
+                p = (t.get('fields') or {}).get('parent', {}).get('key')
+                if p:
+                    children_map_initial.setdefault(p, []).append(k)
+
             sorted_keys = []
             processed = set()
             def add_with_deps(key):
                 if key in processed or key not in jira_tickets_by_key:
                     return
-                ticket = jira_tickets_by_key[key]
-                parent_key = ticket['fields'].get('parent', {}).get('key')
-                if parent_key and parent_key not in processed:
-                    add_with_deps(parent_key)
-                sorted_keys.append(key)
                 processed.add(key)
-            
+                for child_key in children_map_initial.get(key, []):
+                    add_with_deps(child_key)
+                sorted_keys.append(key)
+
             for key in target_keys:
                 add_with_deps(key)
             
-            logging.info(f"[main] Dependency-sorted order: {sorted_keys}")
+            logging.info(f"[main] Dependency-sorted order (children before parents): {sorted_keys}")
 
-            # AUTO-COLLECT CHILDREN: When a parent is migrated, include all its children too.
+            # AUTO-COLLECT CHILDREN: When a parent is migrated, include all its descendants
+            # too (children, grandchildren, etc. — e.g. Epic → Story → Task), not just one
+            # level. BFS keeps descending into every newly-found child's own children.
             # IMPORTANT: Atlassian retired the legacy `GET /rest/api/3/search` endpoint (it now
             # returns "410 Gone" on Cloud instances). search_jql_paginated() uses the current
             # `POST /rest/api/3/search/jql` endpoint, which is what get_filter_items() already
             # relies on successfully elsewhere in this codebase — use the same one here.
             print(f'[bootstrap] Auto-collecting child items for {len(target_keys)} parent key(s)...')
             children_to_add = set()
-            for jira_key in target_keys:
+            from collections import deque as _deque
+            _queue = _deque(target_keys)
+            _visited = set(target_keys)
+            while _queue:
+                jira_key = _queue.popleft()
                 if jira_key not in jira_tickets_by_key:
                     continue
                 try:
@@ -1627,37 +1679,47 @@ def main():
 
                 for child in child_issues:
                     child_key = child.get('key')
-                    if not child_key or child_key in jira_tickets_by_key:
+                    if not child_key:
                         continue
-                    try:
-                        child_ticket = jira_client.get_jira_issue(child_key)
-                    except Exception as e:
-                        logging.warning(f"[main] Could not fetch child {child_key}: {e}")
-                        continue
-                    if child_ticket:
-                        jira_tickets_by_key[child_key] = child_ticket
-                        children_to_add.add(child_key)
-                        logging.debug(f"[main] Auto-collected child: {child_key}")
+                    if child_key not in jira_tickets_by_key:
+                        try:
+                            child_ticket = jira_client.get_jira_issue(child_key)
+                        except Exception as e:
+                            logging.warning(f"[main] Could not fetch child {child_key}: {e}")
+                            continue
+                        if child_ticket:
+                            jira_tickets_by_key[child_key] = child_ticket
+                            children_to_add.add(child_key)
+                            logging.debug(f"[main] Auto-collected child: {child_key}")
+                    # Keep descending — this child may have its own children.
+                    if child_key not in _visited:
+                        _visited.add(child_key)
+                        _queue.append(child_key)
 
             if children_to_add:
-                print(f'[bootstrap] Auto-collected {len(children_to_add)} child item(s). Re-sorting with dependencies...')
-                # Re-sort to include children
+                print(f'[bootstrap] Auto-collected {len(children_to_add)} child item(s) not already in filter results.')
+                # Re-sort so every child is migrated BEFORE its parent (post-order), so
+                # ADO parent/child links can be set up cleanly without orphaned children.
+                children_map = {}
+                for k, t in jira_tickets_by_key.items():
+                    p = (t.get('fields') or {}).get('parent', {}).get('key')
+                    if p:
+                        children_map.setdefault(p, []).append(k)
+
                 sorted_keys_with_children = []
                 processed = set()
-                def add_with_deps(key):
+                def add_children_first(key):
                     if key in processed or key not in jira_tickets_by_key:
                         return
-                    ticket = jira_tickets_by_key[key]
-                    parent_key = (ticket.get('fields') or {}).get('parent', {}).get('key')
-                    if parent_key and parent_key not in processed:
-                        add_with_deps(parent_key)
-                    sorted_keys_with_children.append(key)
                     processed.add(key)
-                
+                    for child_key in children_map.get(key, []):
+                        add_children_first(child_key)
+                    sorted_keys_with_children.append(key)
+
                 for key in sorted_keys + list(children_to_add):
-                    add_with_deps(key)
+                    add_children_first(key)
                 sorted_keys = sorted_keys_with_children
-                logging.info(f"[main] After auto-collecting children: {len(sorted_keys)} total keys to migrate")
+                logging.info(f"[main] Will migrate: {parent_count} parent(s) + {len(children_to_add)} child(ren) = {len(sorted_keys)} total items (children before parents)")
 
             # Detect the Jira board name from the tickets (if not already set by --project-key)
             if not hasattr(args, '_detected_team') or not args._detected_team:
@@ -1668,20 +1730,22 @@ def main():
 
             # Bootstrap: check ADO only for keys NOT already in the local mapping.
             if args.force_create:
-                print(f'[bootstrap] --force-create set — skipping all duplicate detection for {len(sorted_keys)} key(s).')
+                print(f'[bootstrap] --force-create set — skipping duplicate detection for {parent_count} parent key(s).')
             if getattr(args, '_detected_team', None):
-                print(f'[bootstrap] All {len(sorted_keys)} items will be placed under ADO team: "{args._detected_team}"')
+                print(f'[bootstrap] All {parent_count} parent items will be placed under ADO team: "{args._detected_team}"')
+                if children_to_add:
+                    print(f'[bootstrap] Plus {len(children_to_add)} auto-collected child item(s).')
             else:
-                unknown_keys = [k for k in sorted_keys if k not in mapping]
+                unknown_keys = [k for k in target_keys if k not in mapping]
                 if unknown_keys:
-                    print(f'[bootstrap] Checking ADO for {len(unknown_keys)} unknown keys (of {len(sorted_keys)} total)...')
+                    print(f'[bootstrap] Checking ADO for {len(unknown_keys)} parent key(s) (of {parent_count} total)...')
                     ado_existing = ado_client.bulk_fetch_jira_key_mapping(unknown_keys, skip_title_search=True)
                     for jira_key, ado_id in ado_existing.items():
                         mapping[jira_key] = ado_id
                         save_issue_mapping(jira_key, ado_id)
-                    print(f'[bootstrap] Done. {len(ado_existing)} existing items found in ADO.')
+                    print(f'[bootstrap] Done. {len(ado_existing)} existing parent items found in ADO.')
                 else:
-                    print(f'[bootstrap] All {len(sorted_keys)} keys already in local mapping — skipping ADO lookup.')
+                    print(f'[bootstrap] All {parent_count} parent keys already in local mapping — skipping ADO lookup.')
 
             succeeded = []
             failed_items = []
@@ -1693,15 +1757,25 @@ def main():
             _ensure_board_preflight(ado_client, getattr(args, '_detected_team', None))
 
             # PHASE 2: Process in dependency order
+            # Track progress for parent items only (not children)
+            parent_processed = 0
             for jira_key in sorted_keys:
+                # Only count progress for parent items (requested keys), not auto-collected children
+                is_parent = jira_key in target_keys
+                if is_parent:
+                    parent_processed += 1
+                    progress_str = f'[{parent_processed}/{parent_count}]'
+                else:
+                    progress_str = '[child]'
+                
                 jira_ticket = jira_tickets_by_key.get(jira_key)
                 if jira_ticket is None:
-                    logging.error(f"[main] Could not fetch Jira issue {jira_key} — skipping")
+                    logging.error(f"{progress_str} [main] Could not fetch Jira issue {jira_key} — skipping")
                     save_failed_issue(jira_key, "Could not fetch from Jira")
                     failed_items.append(jira_key)
                     continue
 
-                logging.info(f'[main] Copying {jira_key} ...')
+                logging.info(f'{progress_str} [main] Copying {jira_key} ...')
                 mark_issue_started(jira_key)
                 try:
                     ado_id = create_or_update_work_item(
@@ -1862,10 +1936,15 @@ def main():
 
         # AUTO-COLLECT CHILDREN: filter results may not include every subtask/child of a
         # migrated item (e.g. filter scoped to a status, or child lives outside the saved
-        # filter). Search Jira for children of every item in scope and pull them in too.
+        # filter). BFS through every descendant (children, grandchildren, etc.), not just
+        # one level, so e.g. Epic → Story → Task chains are fully collected.
         print(f'[bootstrap] Auto-collecting child items for {len(filter_keys)} key(s)...')
         children_to_add_filter = set()
-        for jira_key in filter_keys:
+        from collections import deque as _deque_filter
+        _queue_filter = _deque_filter(filter_keys)
+        _visited_filter = set(filter_keys)
+        while _queue_filter:
+            jira_key = _queue_filter.popleft()
             try:
                 search_result = jira_client.search_jql_paginated(f'parent = {jira_key}')
             except Exception as e:
@@ -1874,33 +1953,44 @@ def main():
 
             for child in (search_result or {}).get('issues', []):
                 child_key = child.get('key')
-                if not child_key or child_key in jira_tickets_by_key_filter:
+                if not child_key:
                     continue
-                try:
-                    child_ticket = jira_client.get_jira_issue(child_key)
-                except Exception as e:
-                    logging.warning(f"[main] Could not fetch child {child_key}: {e}")
-                    continue
-                if child_ticket:
-                    jira_tickets_by_key_filter[child_key] = child_ticket
-                    children_to_add_filter.add(child_key)
+                if child_key not in jira_tickets_by_key_filter:
+                    try:
+                        child_ticket = jira_client.get_jira_issue(child_key)
+                    except Exception as e:
+                        logging.warning(f"[main] Could not fetch child {child_key}: {e}")
+                        continue
+                    if child_ticket:
+                        jira_tickets_by_key_filter[child_key] = child_ticket
+                        children_to_add_filter.add(child_key)
+                # Keep descending — this child may have its own children.
+                if child_key not in _visited_filter:
+                    _visited_filter.add(child_key)
+                    _queue_filter.append(child_key)
                     logging.debug(f"[main] Auto-collected child: {child_key}")
 
         if children_to_add_filter:
             print(f'[bootstrap] Auto-collected {len(children_to_add_filter)} child item(s) not already in the filter results.')
             filter_keys = filter_keys + list(children_to_add_filter)
 
+        # Ensure children are processed BEFORE their parents (post-order), so ADO
+        # parent/child links are set up cleanly without orphaned children.
+        children_map_filter = {}
+        for k, t in jira_tickets_by_key_filter.items():
+            p = (t.get('fields') or {}).get('parent', {}).get('key')
+            if p:
+                children_map_filter.setdefault(p, []).append(k)
+
         sorted_filter_keys = []
         processed_filter = set()
         def add_filter_with_deps(key):
             if key in processed_filter or key not in jira_tickets_by_key_filter:
                 return
-            ticket = jira_tickets_by_key_filter[key]
-            parent_key = (ticket.get('fields') or {}).get('parent', {}).get('key')
-            if parent_key and parent_key not in processed_filter:
-                add_filter_with_deps(parent_key)
-            sorted_filter_keys.append(key)
             processed_filter.add(key)
+            for child_key in children_map_filter.get(key, []):
+                add_filter_with_deps(child_key)
+            sorted_filter_keys.append(key)
         
         for key in filter_keys:
             add_filter_with_deps(key)

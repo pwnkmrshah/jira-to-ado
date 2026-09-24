@@ -22,10 +22,12 @@ import re
 import subprocess
 import threading
 import uuid
+from collections import deque
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__, static_folder=None)
@@ -1103,6 +1105,64 @@ def migrate():
     if not jira_filter and not jira_keys and not jql:
         logging.warning("MIGRATE rejected: no jira_filter, jira_keys, or jql in request")
         return jsonify({'error': 'Provide jira_filter, jira_keys, or jql'}), 400
+
+    # AUTO-DISCOVER CHILDREN: If jira_keys provided, discover all descendant items
+    # (children, grandchildren, etc. — e.g. Epic → Story → Task) via BFS and include
+    # them in migration so parent and every descendant are migrated together.
+    if jira_keys and jira_url and jira_email and jira_token:
+        original_keys = set(k.strip().upper() for k in jira_keys.split(',') if k.strip())
+        discovered_keys = set()
+        
+        logging.info(f"[migrate] Auto-discovering descendants for parent keys: {original_keys}")
+        
+        queue = deque(original_keys)
+        visited = set(original_keys)
+        while queue:
+            key = queue.popleft()
+            try:
+                # Fetch issue details to check for children
+                issue_url = f"{jira_url.rstrip('/')}/rest/api/3/issue/{key}"
+                issue_resp = requests.get(
+                    issue_url,
+                    auth=(jira_email, jira_token),
+                    timeout=15,
+                    headers={"Accept": "application/json"}
+                )
+                if issue_resp.status_code == 200:
+                    # Query for issues where parent = this key
+                    child_jql = f'parent = "{key}"'
+                    child_search_url = f"{jira_url.rstrip('/')}/rest/api/3/search/jql"
+                    child_resp = requests.post(
+                        child_search_url,
+                        json={"query": child_jql},
+                        auth=(jira_email, jira_token),
+                        timeout=30,
+                        headers={"Accept": "application/json", "Content-Type": "application/json"}
+                    )
+                    
+                    if child_resp.status_code == 200:
+                        child_data = child_resp.json()
+                        for child in child_data.get('issues', []):
+                            child_key = child.get('key', '')
+                            if not child_key:
+                                continue
+                            if child_key not in original_keys:
+                                discovered_keys.add(child_key)
+                                logging.info(f"[migrate] Auto-discovered descendant: {child_key} (parent: {key})")
+                            if child_key not in visited:
+                                visited.add(child_key)
+                                queue.append(child_key)
+                    else:
+                        logging.warning(f"[migrate] Failed to query children for {key}: {child_resp.status_code}")
+            except Exception as e:
+                logging.warning(f"[migrate] Error discovering children for {key}: {e}")
+        
+        if discovered_keys:
+            # Combine original + discovered keys
+            all_keys = original_keys | discovered_keys
+            jira_keys = ','.join(sorted(all_keys))
+            logging.info(f"[migrate] Total keys for migration: {len(all_keys)} (original: {len(original_keys)}, discovered: {len(discovered_keys)})")
+            logging.info(f"[migrate] All keys: {jira_keys}")
 
     cmd = [
         'python3', str(SCRIPTS_DIR / 'worker_jira_to_ado_copy.py'),

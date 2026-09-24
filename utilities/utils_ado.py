@@ -1492,6 +1492,35 @@ class AzureDevOpsClient:
             )
             return False
 
+    def get_work_item_type_field_refs(self, wit_type_name: str) -> set:
+        """Return the referenceNames of fields already usable on a work item type.
+
+        Uses the plain project-level `_apis/wit/workitemtypes/{type}/fields` endpoint
+        (read-only, works for any process — Basic/Agile/Scrum/Inherited), unlike the
+        org-level Process API, which requires 'Edit process' permission. Many fields
+        (e.g. Story Points on User Story) are already part of the type by default, so
+        checking here first avoids an unnecessary — and often permission-denied —
+        attach attempt.
+        """
+        cache = getattr(self, '_wit_type_fields_cache', None)
+        if cache is None:
+            cache = {}
+            self._wit_type_fields_cache = cache
+        if wit_type_name in cache:
+            return cache[wit_type_name]
+        url = (
+            f'{self.organization_url}/{quote(self.project)}'
+            f'/_apis/wit/workitemtypes/{quote(wit_type_name)}/fields?api-version=7.0'
+        )
+        try:
+            resp = self.ado_api_call('GET', url)
+            refs = {f.get('referenceName') for f in (resp or {}).get('value', []) if f.get('referenceName')}
+        except Exception as e:
+            logging.debug(f"[get_work_item_type_field_refs] Could not fetch fields for '{wit_type_name}': {e}")
+            refs = set()
+        cache[wit_type_name] = refs
+        return refs
+
     def get_or_create_custom_field(self, display_name: str, wit_type_name: str,
                                    field_type: str = 'string',
                                    exclude_ref_names: set | None = None) -> str | None:
@@ -1532,7 +1561,11 @@ class AzureDevOpsClient:
                 f"{ref_name} — refusing to reuse it; falling back to description."
             )
             ref_name = None
-        if ref_name and not self.add_field_to_work_item_type(wit_type_name, ref_name):
+        if ref_name and ref_name in self.get_work_item_type_field_refs(wit_type_name):
+            # Already usable on this work item type (e.g. Story Points is on User Story
+            # by default) — skip the attach call entirely, no 'Edit process' permission needed.
+            logging.debug(f"[get_or_create_custom_field] '{display_name}' ({ref_name}) already on '{wit_type_name}' — no attach needed")
+        elif ref_name and not self.add_field_to_work_item_type(wit_type_name, ref_name):
             # Field exists at the org level but couldn't be attached to this work item
             # type — writing to it would 400. Treat as unusable for this type.
             logging.warning(f"[get_or_create_custom_field] Could not attach {ref_name} to '{wit_type_name}'")

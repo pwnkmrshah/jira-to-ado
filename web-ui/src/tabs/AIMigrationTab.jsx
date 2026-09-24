@@ -402,11 +402,11 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
             </div>
           )}
 
-          {/* TYPE MAPPINGS TABLE - EDITABLE */}
+          {/* TYPE MAPPINGS TABLE - EDITABLE (includes related/child item types) */}
           {Array.isArray(analysisResult.type_mappings) && analysisResult.type_mappings.length > 0 && (
             <div className="section">
               <h4>🔗 Type Mappings (Jira → Azure DevOps)</h4>
-              <p className="hint">Click to change how each Jira issue type will be migrated:</p>
+              <p className="hint">Click to change how each Jira issue type will be migrated (includes related/child item types):</p>
               <table className="mapping-table">
                 <thead>
                   <tr>
@@ -453,7 +453,7 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
           {Array.isArray(analysisResult.state_mappings) && analysisResult.state_mappings.length > 0 && (
             <div className="section">
               <h4>🔗 State Mappings (Jira → Azure DevOps)</h4>
-              <p className="hint">Click to change how each Jira status will be migrated:</p>
+              <p className="hint">Click to change how each Jira status will be migrated (includes related/child item statuses):</p>
               <table className="mapping-table">
                 <thead>
                   <tr>
@@ -520,6 +520,14 @@ export default function AIMigrationTab({ onJobStart, onJobEnd }) {
                 ))}
                 {analysisResult.user_gaps.length > 20 && <li>... and {analysisResult.user_gaps.length - 20} more</li>}
               </ul>
+            </div>
+          )}
+
+          {analysisResult.related_items_discovered > 0 && (
+            <div className="section info">
+              <p className="hint">
+                🔗 <strong>{analysisResult.related_items_discovered}</strong> related/child item(s) discovered and included in the mappings above — they'll be auto-migrated with their parent cards (children first).
+              </p>
             </div>
           )}
 

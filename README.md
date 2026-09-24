@@ -1140,6 +1140,103 @@ If you want sprint-specific iteration paths to work:
 
 ---
 
+## Epic & Child Card Auto-Discovery
+
+When migrating Epics or parent cards from Jira to ADO, the worker script **automatically discovers and includes all child cards** to maintain hierarchy.
+
+### How It Works
+
+**When you run:**
+```bash
+python3 jira_ado_copy/scripts/worker_jira_to_ado_copy.py \
+  --jira-instance healthfinch \
+  --jira-keys "PROJ-100"  # An Epic
+  --ado-project "Embedded Refills Engineering"
+```
+
+**The worker:**
+1. Fetches PROJ-100 (the Epic)
+2. Automatically searches Jira for all children: `parent = PROJ-100`
+3. Finds all child Stories, Tasks, Subtasks
+4. **Fetches full details for each child**
+5. **Sorts by dependency:** Ensures parents are processed FIRST, then children
+6. **Migrates in order:** Parent Epic → Child Stories → Child Subtasks
+7. **Links automatically:** After creation, child cards are linked to parent via ADO parent-child relationship
+
+### Example Output
+
+```
+[bootstrap] Sorting 1 parent issue(s) by dependencies...
+[bootstrap] Auto-collecting child items for 1 parent key(s)...
+[bootstrap] Found 12 children for PROJ-100
+[bootstrap] Auto-collected 12 child item(s) not already in filter results.
+[bootstrap] Will migrate: 1 parent(s) + 12 child(ren) = 13 total items
+
+[1/1] [main] Copying PROJ-100 ...  ← Parent (Epic) migrated
+[child] [main] Copying PROJ-101 ... ← Child 1 (Story)
+[child] [main] Copying PROJ-102 ... ← Child 2 (Story)
+[child] [main] Copying PROJ-103 ... ← Child 3 (Subtask)
+...
+```
+
+### Progress Tracking
+
+- **Parent cards** show progress as `[1/1]`, `[2/3]`, etc.
+- **Child cards** show progress as `[child]` (not counted toward parent total)
+- **Total shown:** Only counts parent items (e.g., "1/1" not "13/1")
+
+### Web UI Migration
+
+**To auto-include Epic children through the web UI:**
+
+**Tab: AI Migration**
+1. Select Jira Board
+2. Choose scope: **Specific issues** ← (not "Entire board")
+3. Enter Epic key: `PROJ-100`
+4. Select ADO Project
+5. Click **[Analyze]** → Detects Epic + auto-collects 12 children
+6. Review analysis results
+7. Click **[Proceed to Migration]**
+
+**Result:** Epic + all 12 children migrate together, properly linked.
+
+### API Usage (Backend)
+
+**When using the `/migrate` endpoint:**
+
+```json
+POST /migrate
+{
+  "jira_instance": "healthfinch",
+  "ado_project": "Embedded Refills Engineering",
+  "jira_keys": "PROJ-100",     ← Auto-discovers children
+  "jira_email": "your@email.com",
+  "jira_token": "...",
+  "ado_org": "healthcatalyst",
+  "ado_pat": "..."
+}
+```
+
+Backend passes `--jira-keys "PROJ-100"` to worker, which auto-discovers all children.
+
+### Troubleshooting: Children Not Included
+
+**Symptom:** Epic migrated but children not included.
+
+**Cause:** Using "Entire board" mode without explicit Epic keys.
+
+**Solution:**
+- Use **"Specific issues"** mode in UI and enter Epic key
+- OR pass Epic key explicitly: `--jira-keys "PROJ-100"`
+- OR use a filter that includes all desired issues
+
+**To verify children are auto-collected:**
+1. Check bootstrap logs for: `Auto-collected N child item(s)`
+2. Verify output shows Epic + children in summary
+3. Progress should show mixed `[1/1]` (parent) and `[child]` entries
+
+---
+
 ## Troubleshooting & Known Issues
 
 ### Permission Issues: "VS402356: You do not have permissions to perform operation on this process"
